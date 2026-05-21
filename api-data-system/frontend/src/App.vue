@@ -36,6 +36,10 @@
           <el-icon><Tickets /></el-icon>
           <span>数据与日志</span>
         </el-menu-item>
+        <el-menu-item index="/database">
+          <el-icon><Grid /></el-icon>
+          <span>数据库管理</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 
@@ -67,7 +71,8 @@ import {
   Connection,
   Document,
   Tickets,
-  User
+  User,
+  Grid
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -79,7 +84,8 @@ const pageTitle = computed(() => {
     '/token-management': 'Token管理',
     '/api-management': '接口管理',
     '/field-mapping': '映射配置',
-    '/logs': '数据与日志'
+    '/logs': '数据与日志',
+    '/database': '数据库管理'
   }
   return titleMap[route.path] || '首页'
 })

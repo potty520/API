@@ -5,6 +5,7 @@ import TokenManagement from '../views/TokenManagement.vue'
 import ApiManagement from '../views/ApiManagement.vue'
 import FieldMapping from '../views/FieldMapping.vue'
 import Logs from '../views/Logs.vue'
+import DatabaseManage from '../views/DatabaseManage.vue'
 
 const routes = [
   {
@@ -40,6 +41,11 @@ const routes = [
     path: '/logs',
     name: 'Logs',
     component: Logs
+  },
+  {
+    path: '/database',
+    name: 'DatabaseManage',
+    component: DatabaseManage
   }
 ]
 

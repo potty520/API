@@ -35,6 +35,13 @@ public class ApiResponse<T> {
         return response;
     }
 
+    public static <T> ApiResponse<T> fail(String message) {
+        ApiResponse<T> response = new ApiResponse<>();
+        response.setCode(400);
+        response.setMessage(message);
+        return response;
+    }
+
     public Integer getCode() { return code; }
     public void setCode(Integer code) { this.code = code; }
     public String getMessage() { return message; }
