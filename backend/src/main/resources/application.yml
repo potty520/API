@@ -1,0 +1,68 @@
+server:
+  port: ${INGESTION_PORT:3100}
+  address: 127.0.0.1
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force-request: true
+      force-response: true
+  compression:
+    enabled: true
+
+spring:
+  application:
+    name: json-ingestion-system
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: ${META_DB_URL:jdbc:mysql://127.0.0.1:3306/json_ingestion?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false}
+    username: ${META_DB_USER:json_ingestion}
+    password: ${META_DB_PASSWORD:}
+    hikari:
+      minimum-idle: 2
+      maximum-pool-size: 20
+      connection-timeout: 10000
+      validation-timeout: 3000
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+  quartz:
+    job-store-type: jdbc
+    jdbc:
+      initialize-schema: always
+    properties:
+      org.quartz.scheduler.instanceName: JsonIngestionScheduler
+      org.quartz.scheduler.instanceId: AUTO
+      org.quartz.threadPool.threadCount: 20
+      org.quartz.threadPool.threadPriority: 5
+      org.quartz.jobStore.misfireThreshold: 60000
+      org.quartz.jobStore.tablePrefix: QRTZ_
+      org.quartz.jobStore.isClustered: true
+      org.quartz.jobStore.clusterCheckinInterval: 15000
+  jackson:
+    time-zone: Asia/Shanghai
+    date-format: yyyy-MM-dd HH:mm:ss
+    default-property-inclusion: non_null
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
+logging:
+  level:
+    root: INFO
+    com.example.ingestion: INFO
+  file:
+    name: logs/json-ingestion.log
+
+app:
+  secret-file: ${INGESTION_SECRET_FILE:data/.secret}
+  token-hours: 8
+  demo-url: http://127.0.0.1:${INGESTION_PORT:3100}/demo-api/orders?scenario=v1

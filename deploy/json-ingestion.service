@@ -1,0 +1,36 @@
+[Unit]
+Description=JSON Ingestion System
+Documentation=https://github.com/example/json-ingestion-system
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=ingestion
+Group=ingestion
+WorkingDirectory=/opt/json-ingestion-system
+# ????: ????????/????, ????????
+Environment=META_DB_URL=jdbc:mysql://127.0.0.1:3306/json_ingestion?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+Environment=META_DB_USER=json_ingestion
+Environment=META_DB_PASSWORD=${META_DB_PASSWORD}
+Environment=TARGET_DB_HOST=127.0.0.1
+Environment=TARGET_DB_PORT=3306
+Environment=TARGET_DB_NAME=json_ingestion_target
+Environment=TARGET_DB_USER=json_ingestion
+Environment=TARGET_DB_PASSWORD=${META_DB_PASSWORD}
+Environment=INGESTION_SECRET_FILE=/opt/json-ingestion-system/data/.secret
+# ????????? true; ??????????? false(SSRF ????)
+Environment=INGESTION_ALLOW_PRIVATE_URLS=true
+ExecStart=/usr/bin/java -jar /opt/json-ingestion-system/json-ingestion-system-1.0.0.jar
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# ????
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/json-ingestion-system
+
+[Install]
+WantedBy=multi-user.target
