@@ -1,0 +1,28 @@
+﻿# ============================================================
+#  生产环境外部配置模板
+#  用法: 放到 jar 同目录的 config/ 下, 如 /opt/app/config/application.yml
+#  修改后无需重新打包, 重启应用即生效
+#  优先级: 命令行参数 > 环境变量 > 本文件 > jar 内配置
+# ============================================================
+
+# 元数据库连接(必填: 替换生产库 IP 和密码)
+META_DB_URL: jdbc:mysql://生产库IP:3306/json_ingestion?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+META_DB_USER: json_ingestion
+META_DB_PASSWORD: 生产库密码
+
+# 首次种子目标库连接(应用自动建目标表用)
+TARGET_DB_HOST: 生产库IP
+TARGET_DB_PORT: 3306
+TARGET_DB_NAME: json_ingestion_target
+TARGET_DB_USER: json_ingestion
+TARGET_DB_PASSWORD: 生产库密码
+
+# AES 主密钥文件(首次启动自动生成, 必须纳入备份; 迁移时连同 SQL 一起拷贝)
+INGESTION_SECRET_FILE: /opt/app/data/.secret
+
+# SSRF 防护开关: 接口全公网设 false(更安全); 有内网业务接口设 true
+INGESTION_ALLOW_PRIVATE_URLS: "true"
+
+# HTTP 端口与监听地址
+INGESTION_PORT: 3100
+SERVER_ADDRESS: 0.0.0.0
