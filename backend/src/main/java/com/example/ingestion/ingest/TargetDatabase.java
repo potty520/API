@@ -5,15 +5,46 @@ import com.example.ingestion.common.Jsons;
 import com.example.ingestion.common.JdbcUrlGuard;
 import com.example.ingestion.entity.DataSourceConfig;
 import com.example.ingestion.security.CryptoService;
+import lombok.extern.slf4j.Slf4j;
 
+import java.math.BigDecimal;
 import java.sql.*;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.function.Function;
 
+@Slf4j
 public class TargetDatabase implements AutoCloseable {
-    public record IngestStats(long inserted, long updated, long skipped) {}
-    public record SyncContext(LocalDateTime syncTime, Long taskId, String batchId, String source, int batchSize) {}
+    public record IngestStats(long inserted, long updated, long skipped, long pruned) {}
+    public record SyncContext(LocalDateTime syncTime, Long taskId, String batchId, String source, int batchSize,
+                              boolean fullRefresh) {}
+    public record ColumnInfo(String typeName, int size) {}
+    public record SchemaEvolution(List<String> added, List<String> widened) {
+        public boolean isEmpty() { return added.isEmpty() && widened.isEmpty(); }
+    }
+
+    /** 单次 IN 查询的 key 数量上限, 避免一次性拼出超长 SQL。 */
+    private static final int KEY_LOOKUP_CHUNK = 500;
+
+    /** 字符大对象(TEXT/CLOB 族)的等效长度, 用于判断是否还需要加宽。 */
+    private static final int TEXT_SIZE = 100_000;
+
+    private static final Map<String, Integer> NUMERIC_RANK = Map.ofEntries(
+            Map.entry("BOOL", 10), Map.entry("BOOLEAN", 10), Map.entry("BIT", 10), Map.entry("TINYINT", 10),
+            Map.entry("SMALLINT", 15), Map.entry("INT2", 15),
+            Map.entry("INT", 20), Map.entry("INTEGER", 20), Map.entry("INT4", 20), Map.entry("MEDIUMINT", 20),
+            Map.entry("BIGINT", 30), Map.entry("INT8", 30),
+            Map.entry("DECIMAL", 40), Map.entry("NUMERIC", 40), Map.entry("NUMBER", 40), Map.entry("MONEY", 40),
+            Map.entry("FLOAT", 50), Map.entry("REAL", 50), Map.entry("FLOAT4", 50),
+            Map.entry("DOUBLE", 50), Map.entry("FLOAT8", 50), Map.entry("BINARY_DOUBLE", 50));
+
+    private static final Map<String, Integer> TEXT_RANK = Map.ofEntries(
+            Map.entry("CHAR", 0), Map.entry("BPCHAR", 0), Map.entry("NCHAR", 0), Map.entry("CHARACTER", 0),
+            Map.entry("VARCHAR", 0), Map.entry("NVARCHAR", 0), Map.entry("VARCHAR2", 0),
+            Map.entry("CHARACTER VARYING", 0), Map.entry("NVARCHAR2", 0),
+            Map.entry("TEXT", TEXT_SIZE), Map.entry("TINYTEXT", TEXT_SIZE), Map.entry("MEDIUMTEXT", TEXT_SIZE),
+            Map.entry("LONGTEXT", TEXT_SIZE), Map.entry("CLOB", TEXT_SIZE), Map.entry("NCLOB", TEXT_SIZE),
+            Map.entry("NTEXT", TEXT_SIZE));
 
     public static final Map<String, JsonAnalyzer.ColumnDef> SYSTEM_COLUMNS = Map.of(
             "_record_hash", new JsonAnalyzer.ColumnDef("string", 64),
@@ -82,17 +113,25 @@ public class TargetDatabase implements AutoCloseable {
         return false;
     }
 
-    public Map<String, String> columns(Connection connection, String table) throws SQLException {
+    /** 读取目标表已有列的类型与长度, 供结构演进判断是否需要加宽。 */
+    public Map<String, ColumnInfo> columnInfo(Connection connection, String table) throws SQLException {
         validIdentifier(table);
-        Map<String, String> columns = new LinkedHashMap<>();
+        Map<String, ColumnInfo> columns = new LinkedHashMap<>();
         DatabaseMetaData metadata = connection.getMetaData();
         for (String candidate : List.of(table, table.toUpperCase(Locale.ROOT), table.toLowerCase(Locale.ROOT))) {
             try (ResultSet result = metadata.getColumns(connection.getCatalog(), schemaPattern(), candidate, null)) {
-                while (result.next()) columns.put(result.getString("COLUMN_NAME").toLowerCase(Locale.ROOT), result.getString("TYPE_NAME"));
+                while (result.next()) columns.put(result.getString("COLUMN_NAME").toLowerCase(Locale.ROOT), new ColumnInfo(result.getString("TYPE_NAME"), columnSize(result)));
             }
             if (!columns.isEmpty()) break;
         }
         return columns;
+    }
+
+    /** 部分驱动对 TEXT/BLOB 会返回超过 int 范围的长度, 这里统一夹到 int 区间。 */
+    private static int columnSize(ResultSet result) throws SQLException {
+        long size = result.getLong("COLUMN_SIZE");
+        if (result.wasNull() || size <= 0) return 0;
+        return size > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) size;
     }
 
     public void createTable(Connection connection, String table, Map<String, JsonAnalyzer.ColumnDef> columns, String uniqueKey,
@@ -112,18 +151,78 @@ public class TargetDatabase implements AutoCloseable {
         applyTableComments(connection, table, tableComment, columnComments);
     }
 
-    public List<String> addMissingColumns(Connection connection, String table, Map<String, JsonAnalyzer.ColumnDef> incoming,
-                                            Map<String, String> columnComments) throws SQLException {
-        Map<String, String> existing = columns(connection, table);
+    /**
+     * 对齐表结构: 补齐缺失列, 并在同族类型内按需加宽(VARCHAR(255)->VARCHAR(500)、INT->BIGINT 等)。
+     * 单列加宽失败只告警不中断, 避免权限/锁问题让整批同步失败。
+     */
+    public SchemaEvolution evolveSchema(Connection connection, String table, Map<String, JsonAnalyzer.ColumnDef> incoming,
+                                        Map<String, String> columnComments) throws SQLException {
+        Map<String, ColumnInfo> existing = columnInfo(connection, table);
         List<String> added = new ArrayList<>();
+        List<String> widened = new ArrayList<>();
         for (Map.Entry<String, JsonAnalyzer.ColumnDef> entry : incoming.entrySet()) {
-            if (existing.containsKey(entry.getKey().toLowerCase(Locale.ROOT))) continue;
-            validIdentifier(entry.getKey());
-            execute(connection, "ALTER TABLE " + quote(table) + " ADD " + quote(entry.getKey()) + " " + typeSql(entry.getValue()) + " NULL" + inlineComment(entry.getKey(), columnComments));
-            added.add(entry.getKey());
+            String name = entry.getKey();
+            validIdentifier(name);
+            ColumnInfo current = existing.get(name.toLowerCase(Locale.ROOT));
+            if (current == null) {
+                execute(connection, "ALTER TABLE " + quote(table) + " ADD " + quote(name) + " " + typeSql(entry.getValue()) + " NULL" + inlineComment(name, columnComments));
+                added.add(name);
+                continue;
+            }
+            String alter = widenSql(table, name, current, entry.getValue(), columnComments);
+            if (alter == null) continue;
+            try {
+                execute(connection, alter);
+                widened.add(name + "(" + current.typeName() + "->" + typeSql(entry.getValue()) + ")");
+            } catch (SQLException error) {
+                log.warn("表 {} 列 {} 加宽失败, 已跳过: {}", table, name, error.getMessage());
+            }
         }
         applyColumnComments(connection, table, columnComments == null ? Map.of() : columnComments, new java.util.HashSet<>(added));
-        return added;
+        return new SchemaEvolution(added, widened);
+    }
+
+    /** 只做"同族升秩/加长"的安全加宽, 其余情况返回 null 表示不动。 */
+    private String widenSql(String table, String column, ColumnInfo current, JsonAnalyzer.ColumnDef incoming, Map<String, String> columnComments) {
+        String existingType = current.typeName() == null ? "" : current.typeName().trim().toUpperCase(Locale.ROOT);
+        Integer existingText = TEXT_RANK.get(existingType);
+        String incomingType = incoming.type();
+        if (incomingType.equals("string") || incomingType.equals("text")) {
+            String target = alterTypeSql(table, column, typeSql(incoming), columnComments);
+            // 已有列不是字符类型(数字/时间), 说明来源类型漂移, 放宽为字符类型以保住数据
+            if (existingText == null) return target;
+            int available = existingText > 0 ? existingText : current.size();
+            return bucketLength(incoming) > available ? target : null;
+        }
+        Integer incomingRank = numericRank(incomingType);
+        Integer existingRank = NUMERIC_RANK.get(existingType);
+        if (incomingRank == null || existingRank == null || incomingRank <= existingRank) return null;
+        return alterTypeSql(table, column, typeSql(incoming), columnComments);
+    }
+
+    private String alterTypeSql(String table, String column, String targetType, Map<String, String> columnComments) {
+        String quoted = quote(column);
+        return switch (dialect) {
+            // MySQL 的 MODIFY 不写 COMMENT 会丢掉原有列注释, 这里补回
+            case "mysql" -> "ALTER TABLE " + quote(table) + " MODIFY " + quoted + " " + targetType + " NULL" + inlineComment(column, columnComments);
+            case "postgres" -> "ALTER TABLE " + quote(table) + " ALTER COLUMN " + quoted + " TYPE " + targetType + " USING CAST(" + quoted + " AS " + targetType + ")";
+            case "sqlserver" -> "ALTER TABLE " + quote(table) + " ALTER COLUMN " + quoted + " " + targetType + " NULL";
+            case "oracle" -> "ALTER TABLE " + quote(table) + " MODIFY (" + quoted + " " + targetType + ")";
+            default -> throw new IllegalArgumentException("未知数据库类型");
+        };
+    }
+
+    private static Integer numericRank(String logicalType) {
+        return switch (logicalType) { case "boolean" -> 10; case "integer" -> 20; case "bigint" -> 30; case "decimal" -> 40; default -> null; };
+    }
+
+    private static int bucketLength(JsonAnalyzer.ColumnDef definition) {
+        if (definition.type().equals("text")) return TEXT_SIZE;
+        int length = definition.length();
+        if (length <= 255) return 255;
+        if (length <= 500) return 500;
+        if (length <= 1000) return 1000;
+        return TEXT_SIZE;
     }
 
     public void ensureUniqueIndex(Connection connection, String table, String key) throws SQLException {
@@ -135,41 +234,115 @@ public class TargetDatabase implements AutoCloseable {
         execute(connection, "CREATE UNIQUE INDEX " + quote(indexName(table, key)) + " ON " + quote(table) + " (" + quote(key) + ")");
     }
 
-    public void deleteRows(Connection connection, String table) throws SQLException {
-        execute(connection, "DELETE FROM " + quote(table));
-    }
-
     public IngestStats ingest(Connection connection, String table, List<Map<String, Object>> rows,
                               String uniqueKey, SyncContext context) throws SQLException {
         validIdentifier(table);
         validIdentifier(uniqueKey);
-        Map<String, String> existing = new HashMap<>();
-        String select = "SELECT " + quote(uniqueKey) + "," + quote("_record_hash") + " FROM " + quote(table);
-        try (Statement statement = connection.createStatement(); ResultSet result = statement.executeQuery(select)) {
-            while (result.next()) existing.put(String.valueOf(result.getObject(1)), result.getString(2));
-        }
-
-        Map<List<String>, List<Map<String, Object>>> inserts = new LinkedHashMap<>();
-        Map<List<String>, List<Map<String, Object>>> updates = new LinkedHashMap<>();
-        long skipped = 0;
+        List<Map<String, Object>> prepared = new ArrayList<>(rows.size());
+        Set<Object> keys = new LinkedHashSet<>();
         for (Map<String, Object> raw : rows) {
             Map<String, Object> row = prepare(raw, context);
             Object keyValue = row.get(uniqueKey);
             if (keyValue == null || String.valueOf(keyValue).isBlank()) throw new SQLException("业务唯一Key为空: " + uniqueKey);
-            String keyText = String.valueOf(keyValue);
-            String currentHash = existing.get(keyText);
+            prepared.add(row);
+            keys.add(keyValue);
+        }
+        // 只按本批 Key 回查已有哈希, 避免每次同步都全表扫描
+        Map<String, String> existing = loadExisting(connection, table, uniqueKey, new ArrayList<>(keys));
+
+        Map<List<String>, List<Map<String, Object>>> inserts = new LinkedHashMap<>();
+        Map<List<String>, List<Map<String, Object>>> updates = new LinkedHashMap<>();
+        List<Object> touchedKeys = new ArrayList<>();
+        long skipped = 0;
+        for (Map<String, Object> row : prepared) {
+            Object keyValue = row.get(uniqueKey);
+            String normalizedKey = keyText(keyValue);
+            String currentHash = existing.get(normalizedKey);
             if (Objects.equals(currentHash, row.get("_record_hash"))) {
                 skipped++;
+                // 全量刷新时, 未变化的行也要盖上本批批次号, 否则会被清理逻辑误删
+                if (context.fullRefresh()) touchedKeys.add(keyValue);
                 continue;
             }
             List<String> names = new ArrayList<>(row.keySet());
             if (currentHash == null) inserts.computeIfAbsent(List.copyOf(names), ignored -> new ArrayList<>()).add(row);
             else updates.computeIfAbsent(List.copyOf(names), ignored -> new ArrayList<>()).add(row);
-            existing.put(keyText, String.valueOf(row.get("_record_hash")));
+            existing.put(normalizedKey, String.valueOf(row.get("_record_hash")));
         }
         long inserted = executeInsertGroups(connection, table, inserts, context.batchSize());
         long updated = executeUpdateGroups(connection, table, uniqueKey, updates, context.batchSize());
-        return new IngestStats(inserted, updated, skipped);
+        long pruned = context.fullRefresh() ? touchAndPrune(connection, table, uniqueKey, touchedKeys, context.batchId(), context.taskId()) : 0;
+        return new IngestStats(inserted, updated, skipped, pruned);
+    }
+
+    /** 分块回查本批 Key 对应的已有记录哈希。 */
+    private Map<String, String> loadExisting(Connection connection, String table, String uniqueKey, List<Object> keys) throws SQLException {
+        Map<String, String> existing = new HashMap<>();
+        if (keys.isEmpty()) return existing;
+        String prefix = "SELECT " + quote(uniqueKey) + "," + quote("_record_hash") + " FROM " + quote(table) + " WHERE " + quote(uniqueKey) + " IN (";
+        for (int start = 0; start < keys.size(); start += KEY_LOOKUP_CHUNK) {
+            List<Object> chunk = keys.subList(start, Math.min(keys.size(), start + KEY_LOOKUP_CHUNK));
+            String sql = prefix + String.join(",", Collections.nCopies(chunk.size(), "?")) + ")";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                for (int index = 0; index < chunk.size(); index++) set(statement, index + 1, chunk.get(index));
+                try (ResultSet result = statement.executeQuery()) {
+                    while (result.next()) existing.put(keyText(result.getObject(1)), result.getString(2));
+                }
+            }
+        }
+        return existing;
+    }
+
+    /** 归一化 Key 文本, 让"库里回读的值"与"本批 JSON 的值"能对齐(1.0 与 1、时间格式、二进制等)。 */
+    private static String keyText(Object value) {
+        if (value == null) return "";
+        if (value instanceof BigDecimal decimal) return decimal.stripTrailingZeros().toPlainString();
+        if (value instanceof Double || value instanceof Float) {
+            double number = ((Number) value).doubleValue();
+            if (Double.isNaN(number) || Double.isInfinite(number)) return String.valueOf(number);
+            return number == Math.rint(number) ? Long.toString((long) number) : BigDecimal.valueOf(number).stripTrailingZeros().toPlainString();
+        }
+        if (value instanceof Number number) return number.toString();
+        if (value instanceof Timestamp timestamp) return timestamp.toLocalDateTime().toString();
+        if (value instanceof java.sql.Date date) return date.toLocalDate().toString();
+        if (value instanceof java.sql.Time time) return time.toLocalTime().toString();
+        if (value instanceof LocalDateTime dateTime) return dateTime.toString();
+        if (value instanceof byte[] bytes) return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+        return String.valueOf(value);
+    }
+
+    /**
+     * 全量刷新收尾: 先给未变化的行补上本批批次号, 再删除本任务遗留的旧行。
+     * 相比"先 DELETE 全表再写入", 中途失败不会把已有数据清空。
+     */
+    private long touchAndPrune(Connection connection, String table, String uniqueKey, List<Object> touchedKeys, String batchId, Long taskId) throws SQLException {
+        if (!touchedKeys.isEmpty()) {
+            String prefix = "UPDATE " + quote(table) + " SET " + quote("_batch_id") + "=? WHERE " + quote(uniqueKey) + " IN (";
+            for (int start = 0; start < touchedKeys.size(); start += KEY_LOOKUP_CHUNK) {
+                List<Object> chunk = touchedKeys.subList(start, Math.min(touchedKeys.size(), start + KEY_LOOKUP_CHUNK));
+                String sql = prefix + String.join(",", Collections.nCopies(chunk.size(), "?")) + ")";
+                try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                    statement.setString(1, batchId);
+                    for (int index = 0; index < chunk.size(); index++) set(statement, index + 2, chunk.get(index));
+                    statement.executeUpdate();
+                }
+            }
+        }
+        return pruneStaleRows(connection, table, batchId, taskId);
+    }
+
+    /** 删除本任务写入、但批次号已不是当前批次的历史行(仅影响本任务, 不动其它任务或人工写入的数据)。 */
+    public long pruneStaleRows(Connection connection, String table, String batchId, Long taskId) throws SQLException {
+        validIdentifier(table);
+        String sql = "DELETE FROM " + quote(table) + " WHERE " + quote("_task_id") + "=? AND ("
+                + quote("_batch_id") + " IS NULL OR " + quote("_batch_id") + "<>?)";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            if (taskId == null) statement.setNull(1, Types.BIGINT);
+            else statement.setLong(1, taskId);
+            statement.setString(2, batchId);
+            statement.setString(3, batchId);
+            return statement.executeUpdate();
+        }
     }
 
     public List<Map<String, Object>> preview(String table, int limit) throws SQLException {

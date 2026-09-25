@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit;
 public class SyncEngine {
     public record ExecuteOptions(String triggerType, boolean fullRefresh, String requestedBy) {}
     private record SyncOutcome(TargetDatabase.IngestStats mainStats, List<Map<String, Object>> schemaChanges,
-                               List<String> childNames, boolean existed, boolean hasUniqueKey) {}
+                               List<String> childNames, boolean existed, boolean hasUniqueKey, long pruned) {}
 
     private final InterfaceTaskMapper tasks;
     private final DataSourceConfigMapper sources;
@@ -128,7 +128,7 @@ public class SyncEngine {
 
             DataSourceConfig source = sources.selectById(task.getDatasourceId());
             if (source == null || !Boolean.TRUE.equals(source.getActive())) throw new ApiException(422, "目标数据源不存在或未启用");
-            String table = JsonAnalyzer.snake(task.getTableName().isBlank() ? "auto_data_" + task.getCode() : task.getTableName());
+            String table = resolveTable(task);
             String configuredKey = analyzer.mapBusinessKey(task.getUniqueKey(), analysis);
             List<String> previousChildren = latestChildNames(taskId);
             int batchSize = settingInt("batch_size", 1000);
@@ -179,8 +179,9 @@ public class SyncEngine {
             database.createTable(connection, table, analysis.columns(), effectiveKey, task.getName(), commenter.comments(analysis.columns().keySet()));
             changes.add(change("CREATE_TABLE", table, analysis.columns().keySet()));
         } else {
-            List<String> added = database.addMissingColumns(connection, table, analysis.columns(), commenter.comments(analysis.columns().keySet()));
-            if (!added.isEmpty()) changes.add(change("ADD_COLUMNS", table, added));
+            // 已存在的表也要保证系统列齐全, 否则缺少 _batch_id/_task_id 会让写入与清理失败
+            changes.addAll(evolutionChanges(table, database.evolveSchema(connection, table,
+                    withSystemColumns(analysis.columns()), commenter.comments(analysis.columns().keySet()))));
             database.ensureUniqueIndex(connection, table, effectiveKey);
         }
 
@@ -196,43 +197,57 @@ public class SyncEngine {
                     database.createTable(connection, childTable, child.columns, "_child_key", task.getName() + "-" + childName, commenter.comments(child.columns.keySet()));
                     changes.add(change("CREATE_CHILD_TABLE", childTable, child.columns.keySet()));
                 } else {
-                    List<String> added = database.addMissingColumns(connection, childTable, child.columns, commenter.comments(child.columns.keySet()));
-                    if (!added.isEmpty()) changes.add(change("ADD_COLUMNS", childTable, added));
+                    changes.addAll(evolutionChanges(childTable, database.evolveSchema(connection, childTable,
+                            withSystemColumns(child.columns), commenter.comments(child.columns.keySet()))));
                     database.ensureUniqueIndex(connection, childTable, "_child_key");
                 }
             }
         }
 
-        boolean modeFull = fullRefresh || !existed;
-        if (modeFull && existed) {
-            database.deleteRows(connection, table);
+        TargetDatabase.SyncContext context = new TargetDatabase.SyncContext(LocalDateTime.now(), task.getId(), batchId,
+                task.getSourceLabel() == null || task.getSourceLabel().isBlank() ? task.getUrl() : task.getSourceLabel(), batchSize, fullRefresh);
+        // 全量刷新不再"先清空表再写入": 写入完成后由 ingest 按批次号清理旧行, 中途失败原数据仍在
+        TargetDatabase.IngestStats main = database.ingest(connection, table, analysis.rows(), effectiveKey, context);
+        long pruned = main.pruned();
+        for (Map.Entry<String, JsonAnalyzer.ChildAnalysis> entry : analysis.childTables().entrySet()) {
+            pruned += database.ingest(connection, childTable(table, entry.getKey()), entry.getValue().rows, "_child_key", context).pruned();
+        }
+        if (fullRefresh) {
+            // 本次响应里已经消失的子表, 清掉本任务留下的历史行
             for (String childName : allChildNames) {
+                if (currentChildren.contains(childName)) continue;
                 String childTable = childTable(table, childName);
-                if (database.tableExists(connection, childTable)) database.deleteRows(connection, childTable);
+                if (database.tableExists(connection, childTable)) pruned += database.pruneStaleRows(connection, childTable, batchId, task.getId());
             }
         }
-        TargetDatabase.SyncContext context = new TargetDatabase.SyncContext(LocalDateTime.now(), task.getId(), batchId,
-                task.getSourceLabel() == null || task.getSourceLabel().isBlank() ? task.getUrl() : task.getSourceLabel(), batchSize);
-        TargetDatabase.IngestStats main = database.ingest(connection, table, analysis.rows(), effectiveKey, context);
-        for (Map.Entry<String, JsonAnalyzer.ChildAnalysis> entry : analysis.childTables().entrySet()) {
-            database.ingest(connection, childTable(table, entry.getKey()), entry.getValue().rows, "_child_key", context);
-        }
-        return new SyncOutcome(main, changes, currentChildren, existed, hasKey);
+        return new SyncOutcome(main, changes, currentChildren, existed, hasKey, pruned);
     }
 
     private void enrichChildren(JsonAnalyzer.Analysis analysis, String effectiveKey) {
         Map<Integer, Map<String, Object>> parents = new HashMap<>();
         for (Map<String, Object> row : analysis.rows()) parents.put(((Number) row.get("_source_index")).intValue(), row);
         for (JsonAnalyzer.ChildAnalysis child : analysis.childTables().values()) {
+            Map<String, Integer> occurrences = new HashMap<>();
             for (Map<String, Object> row : child.rows) {
                 int parentIndex = ((Number) row.get("_parent_source_index")).intValue();
                 Map<String, Object> parent = parents.get(parentIndex);
                 String parentKey = String.valueOf(parent.getOrDefault(effectiveKey, parent.get("_record_hash")));
                 row.put("_parent_key", parentKey);
-                row.put("_child_key", Hashing.sha256(parentKey + ":" + row.get("_item_index")));
+                // _child_key 改为内容寻址: 数组换顺序不再被判定成"整批数据都变了", 相同内容按出现次序区分
+                Map<String, Object> content = new LinkedHashMap<>(row);
+                content.remove("_item_index");
+                content.remove("_parent_source_index");
+                content.remove("_parent_hash");
+                content.remove("_child_key");
+                content.remove("_record_hash");
+                String contentHash = Hashing.sha256(content);
+                int occurrence = occurrences.merge(parentKey + "|" + contentHash, 1, Integer::sum);
+                row.put("_child_key", Hashing.sha256(parentKey + ":" + contentHash + ":" + occurrence));
                 Map<String, Object> hashFields = new LinkedHashMap<>(row);
                 hashFields.remove("_record_hash");
                 hashFields.remove("_parent_source_index");
+                // _item_index 只是数组下标, 参与哈希会让"顺序变化"被误判成"内容变化"
+                hashFields.remove("_item_index");
                 row.put("_record_hash", Hashing.sha256(hashFields));
             }
         }
@@ -241,7 +256,8 @@ public class SyncEngine {
     public Map<String, Object> preview(Long taskId, int limit) throws Exception {
         InterfaceTask task = requireTask(taskId);
         DataSourceConfig source = sources.selectById(task.getDatasourceId());
-        String table = JsonAnalyzer.snake(task.getTableName());
+        if (source == null || !Boolean.TRUE.equals(source.getActive())) throw new ApiException(422, "目标数据源不存在或未启用");
+        String table = resolveTable(task);
         try (TargetDatabase database = databases.create(source); Connection connection = database.open()) {
             if (!database.tableExists(connection, table)) return Map.of("table", table, "items", List.of(), "childTables", List.of());
             List<Map<String, Object>> childTables = new ArrayList<>();
@@ -266,7 +282,7 @@ public class SyncEngine {
         run.setStartedAt(started); run.setDurationMs(0L); run.setResponseMs(0L); run.setAttemptCount(0);
         run.setTotalCount(0L); run.setInsertedCount(0L); run.setUpdatedCount(0L); run.setSkippedCount(0L);
         run.setFailedCount(0L); run.setEmptyCount(0L); run.setBatchId(batchId);
-        run.setTargetTable(JsonAnalyzer.snake(task.getTableName())); run.setSchemaChanges("[]");
+        run.setTargetTable(resolveTable(task)); run.setSchemaChanges("[]");
         run.setRequestedBy(options.requestedBy()); run.setDetailJson("{}");
         return run;
     }
@@ -288,7 +304,8 @@ public class SyncEngine {
         run.setInsertedCount(outcome.mainStats().inserted()); run.setUpdatedCount(outcome.mainStats().updated());
         run.setSkippedCount(outcome.mainStats().skipped()); run.setFailedCount(0L);
         run.setEmptyCount((long) (extraction.totalRaw() - analysis.rows().size())); run.setSchemaChanges(jsons.write(outcome.schemaChanges()));
-        run.setErrorMessage(warning); run.setDetailJson(jsons.write(Map.of("root", extraction.detectedRoot(), "childTables", outcome.childNames())));
+        run.setErrorMessage(warning);
+        run.setDetailJson(jsons.write(Map.of("root", extraction.detectedRoot(), "childTables", outcome.childNames(), "pruned", outcome.pruned())));
         runs.updateById(run);
     }
 
@@ -340,6 +357,25 @@ public class SyncEngine {
 
     private Map<String, Object> change(String action, String table, Collection<String> columns) {
         return Map.of("action", action, "table", table, "columns", List.copyOf(columns));
+    }
+
+    private List<Map<String, Object>> evolutionChanges(String table, TargetDatabase.SchemaEvolution evolution) {
+        List<Map<String, Object>> changes = new ArrayList<>();
+        if (!evolution.added().isEmpty()) changes.add(change("ADD_COLUMNS", table, evolution.added()));
+        if (!evolution.widened().isEmpty()) changes.add(change("WIDEN_COLUMNS", table, evolution.widened()));
+        return changes;
+    }
+
+    private Map<String, JsonAnalyzer.ColumnDef> withSystemColumns(Map<String, JsonAnalyzer.ColumnDef> columns) {
+        Map<String, JsonAnalyzer.ColumnDef> all = new LinkedHashMap<>(columns);
+        TargetDatabase.SYSTEM_COLUMNS.forEach(all::putIfAbsent);
+        return all;
+    }
+
+    /** 表名推导要和 execute 保持一致, 否则执行记录/数据预览会指向另一张表。 */
+    private String resolveTable(InterfaceTask task) {
+        String name = task.getTableName() == null || task.getTableName().isBlank() ? "auto_data_" + task.getCode() : task.getTableName();
+        return JsonAnalyzer.snake(name);
     }
 
     private String childTable(String table, String childName) {

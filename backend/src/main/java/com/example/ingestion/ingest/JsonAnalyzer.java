@@ -180,9 +180,12 @@ public class JsonAnalyzer {
     private String columnName(String sourcePath, Map<String, String> pathColumns, Set<String> used) {
         if (pathColumns.containsKey(sourcePath)) return pathColumns.get(sourcePath);
         String base = snake(sourcePath.replace('.', '_'));
+        // 冲突后缀取来源路径哈希: 同一字段在不同批次/不同字段顺序下都能得到稳定列名(自增后缀会随顺序漂移)
+        String digest = Hashing.sha256(sourcePath);
         String candidate = base;
+        for (int length = 6; length <= 16 && used.contains(candidate); length += 2) candidate = base + "_" + digest.substring(0, length);
         int suffix = 2;
-        while (used.contains(candidate)) candidate = base.substring(0, Math.min(55, base.length())) + "_" + suffix++;
+        while (used.contains(candidate)) candidate = base + "_" + digest.substring(0, 8) + "_" + suffix++;
         used.add(candidate);
         pathColumns.put(sourcePath, candidate);
         return candidate;
