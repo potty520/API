@@ -1,5 +1,7 @@
 package com.example.ingestion.web;
 
+import com.example.ingestion.common.ClientIp;
+import com.example.ingestion.common.ClientIp;
 import com.example.ingestion.security.AuthService;
 import com.example.ingestion.security.SessionPrincipal;
 import com.example.ingestion.security.TokenService;
@@ -81,7 +83,7 @@ public class AuthController {
     }
 
     private String ip(HttpServletRequest request) {
-        // 服务仅绑定 127.0.0.1，不信任客户端可伪造的 X-Forwarded-For，避免绕过登录锁定
-        return request.getRemoteAddr();
+        // 统一走 ClientIp: 只有本机反代场景才采信 X-Forwarded-For, 避免伪造绕过登录锁定
+        return ClientIp.of(request);
     }
 }

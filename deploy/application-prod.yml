@@ -48,3 +48,6 @@ INGESTION_INIT_VIEWER_PASSWORD: ""
 
 # ---- 是否播种演示任务(生产建议 false) ----
 INGESTION_SEED_DEMO: "false"
+
+# ---- 内置免鉴权演示接口 /demo-api(生产建议 false) ----
+INGESTION_DEMO_API: "false"

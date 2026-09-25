@@ -25,9 +25,11 @@ public class SecurityConfig {
         return http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/api/login", "/api/health", "/demo-api/**", "/", "/index.html", "/assets/**", "/favicon.ico").permitAll()
+                        .requestMatchers("/api/login", "/api/health", "/demo-api/**", "/", "/index.html",
+                                "/assets/**", "/favicon.ico", "/favicon.svg").permitAll()
                         .requestMatchers("/api/**").authenticated()
-                        .anyRequest().permitAll())
+                        // 默认拒绝: 以后新增 actuator 等端点不会被顺手放开
+                        .anyRequest().authenticated())
                 .exceptionHandling(errors -> errors.authenticationEntryPoint((request, response, error) -> {
                     response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
                     response.setContentType("application/json;charset=UTF-8");

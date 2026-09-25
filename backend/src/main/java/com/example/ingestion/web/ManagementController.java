@@ -3,6 +3,7 @@ package com.example.ingestion.web;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.example.ingestion.common.ApiException;
+import com.example.ingestion.common.ClientIp;
 import com.example.ingestion.common.Jsons;
 import com.example.ingestion.common.JdbcUrlGuard;
 import com.example.ingestion.entity.*;
@@ -32,6 +33,11 @@ public class ManagementController {
     /** 仅管理员可改的系统参数: 它们决定外发地址或会进入建表语句的文本。 */
     private static final Set<String> ADMIN_ONLY_SETTINGS = Set.of(
             "alert_webhook_url", "ollama_url", "ollama_model", "comment_translate_enabled", "field_comment_map");
+
+    /** 这些名字的请求头/参数/正文字段视为凭据, 一律不通过接口回显。 */
+    private static final java.util.regex.Pattern SECRET_KEY = java.util.regex.Pattern.compile(
+            "(?i)(authorization|token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|signature|cookie|credential)");
+    private static final String MASK = "******";
 
     private final AuthService auth;
     private final AuditService audit;
@@ -407,8 +413,8 @@ public class ManagementController {
         Map<String, Object> authConfig = body.get("auth") instanceof Map<?, ?> map ? stringMap(map) : current == null ? new LinkedHashMap<>() : jsons.map(crypto.decrypt(current.getAuthJsonEnc()));
         if (current != null) {
             Map<String, Object> previous = jsons.map(crypto.decrypt(current.getAuthJsonEnc()));
-            if ("******".equals(authConfig.get("password"))) authConfig.put("password", previous.get("password"));
-            if ("******".equals(authConfig.get("fixedToken"))) authConfig.put("fixedToken", previous.get("fixedToken"));
+            if (MASK.equals(authConfig.get("password"))) authConfig.put("password", previous.get("password"));
+            if (MASK.equals(authConfig.get("fixedToken"))) authConfig.put("fixedToken", previous.get("fixedToken"));
         }
         LocalDateTime now = LocalDateTime.now();
         InterfaceTask task = new InterfaceTask();
@@ -417,9 +423,18 @@ public class ManagementController {
         task.setGroupId(longValue(body.get("groupId"), null)); task.setUrl(url); task.setMethod(method);
         task.setDescription(string(body.get("description"))); task.setEnabled(bool(body.get("enabled"), false));
         task.setStatus(current == null ? "未执行" : current.getStatus());
-        task.setHeadersJson(jsons.write(body.get("headers") instanceof Map<?, ?> map ? map : Map.of()));
-        task.setQueryJson(jsons.write(body.get("query") instanceof Map<?, ?> map ? map : Map.of()));
-        task.setBodyJson(jsons.write(body.get("body") instanceof Map<?, ?> map ? map : Map.of()));
+        Map<String, Object> headers = body.get("headers") instanceof Map<?, ?> headerMap ? stringMap(headerMap) : new LinkedHashMap<>();
+        Map<String, Object> query = body.get("query") instanceof Map<?, ?> queryMap ? stringMap(queryMap) : new LinkedHashMap<>();
+        Map<String, Object> payload = body.get("body") instanceof Map<?, ?> bodyMap ? stringMap(bodyMap) : new LinkedHashMap<>();
+        if (current != null) {
+            // 回显时敏感值被打码成 ******, 保存时必须还原成库里的原值, 否则会把掩码写进配置
+            restoreMasked(headers, jsons.map(current.getHeadersJson()));
+            restoreMasked(query, jsons.map(current.getQueryJson()));
+            restoreMasked(payload, jsons.map(current.getBodyJson()));
+        }
+        task.setHeadersJson(jsons.write(headers));
+        task.setQueryJson(jsons.write(query));
+        task.setBodyJson(jsons.write(payload));
         task.setAuthType(authType); task.setAuthJsonEnc(crypto.encrypt(jsons.write(authConfig)));
         task.setRootPath(string(body.get("rootPath"))); task.setDatasourceId(datasourceId);
         String tableName = string(body.get("tableName"));
@@ -445,7 +460,14 @@ public class ManagementController {
     private Map<String, Object> publicTask(InterfaceTask task) {
         Map<String, Object> map = bean(task);
         map.remove("authJsonEnc");
-        map.put("headers", jsons.map(task.getHeadersJson())); map.put("query", jsons.map(task.getQueryJson())); map.put("body", jsons.map(task.getBodyJson()));
+        Map<String, Object> headers = jsons.map(task.getHeadersJson());
+        Map<String, Object> query = jsons.map(task.getQueryJson());
+        Map<String, Object> payload = jsons.map(task.getBodyJson());
+        // headers/query 里常放 API Key、签名与 Token, 与密码同等对待
+        maskSecrets(headers);
+        maskSecrets(query);
+        maskSecrets(payload);
+        map.put("headers", headers); map.put("query", query); map.put("body", payload);
         TaskGroup group = task.getGroupId() == null ? null : groups.selectById(task.getGroupId());
         DataSourceConfig source = sources.selectById(task.getDatasourceId());
         map.put("groupName", group == null ? "未分组" : group.getName());
@@ -460,6 +482,9 @@ public class ManagementController {
         Map<String, Object> map = bean(run);
         InterfaceTask task = tasks.selectById(run.getTaskId());
         map.put("taskName", task == null ? "已删除" : task.getName()); map.put("taskCode", task == null ? "" : task.getCode());
+        // 完整堆栈只留在库内与日志里; 异常文本可能带出 SQL 与连接串, 截断后下发
+        map.remove("errorStack");
+        map.put("errorMessage", truncate(run.getErrorMessage(), 300));
         return map;
     }
 
@@ -473,7 +498,37 @@ public class ManagementController {
     private DataSourceConfig requireSource(Long id) { DataSourceConfig source = sources.selectById(id); if (source == null) throw new ApiException(404, "数据源不存在"); return source; }
     private InterfaceTask requireTask(Long id) { InterfaceTask task = tasks.selectById(id); if (task == null) throw new ApiException(404, "任务不存在"); return task; }
     private Map<String, Object> bean(Object value) { return jsons.mapper().convertValue(value, new TypeReference<LinkedHashMap<String, Object>>() {}); }
-    private void mask(Map<String, Object> map, String key) { if (map.get(key) != null && !String.valueOf(map.get(key)).isBlank()) map.put(key, "******"); }
+    private void mask(Map<String, Object> map, String key) { if (map.get(key) != null && !String.valueOf(map.get(key)).isBlank()) map.put(key, MASK); }
+
+    @SuppressWarnings("unchecked")
+    private void maskSecrets(Map<String, Object> map) {
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof Map<?, ?>) {
+                maskSecrets((Map<String, Object>) value);
+            } else if (SECRET_KEY.matcher(entry.getKey()).find() && value != null && !String.valueOf(value).isBlank()) {
+                entry.setValue(MASK);
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void restoreMasked(Map<String, Object> incoming, Map<String, Object> previous) {
+        for (Map.Entry<String, Object> entry : incoming.entrySet()) {
+            Object value = entry.getValue();
+            Object old = previous.get(entry.getKey());
+            if (value instanceof Map<?, ?> && old instanceof Map<?, ?>) {
+                restoreMasked((Map<String, Object>) value, (Map<String, Object>) old);
+            } else if (MASK.equals(value) && old != null) {
+                entry.setValue(old);
+            }
+        }
+    }
+
+    private String truncate(String value, int max) {
+        if (value == null) return "";
+        return value.length() <= max ? value : value.substring(0, max) + "...";
+    }
     private String required(Map<String, Object> body, String key, String label) { String value = string(body.get(key)).trim(); if (value.isBlank()) throw new ApiException(422, label + "不能为空"); return value; }
     private String string(Object value) { return value == null ? "" : String.valueOf(value); }
     private boolean bool(Object value, boolean fallback) { if (value == null) return fallback; return value instanceof Boolean bool ? bool : Boolean.parseBoolean(String.valueOf(value)); }
@@ -481,7 +536,7 @@ public class ManagementController {
     private Long longValue(Object value, Long fallback) { if (value == null || String.valueOf(value).isBlank()) return fallback; return Long.parseLong(String.valueOf(value)); }
     private int clamp(int value, int min, int max) { return Math.max(min, Math.min(max, value)); }
     private Map<String, Object> stringMap(Map<?, ?> source) { Map<String, Object> result = new LinkedHashMap<>(); source.forEach((key, value) -> result.put(String.valueOf(key), value)); return result; }
-    private String ip(HttpServletRequest request) { String forwarded = request.getHeader("X-Forwarded-For"); return forwarded == null ? request.getRemoteAddr() : forwarded.split(",")[0].trim(); }
+    private String ip(HttpServletRequest request) { return ClientIp.of(request); }
     private void requireAny(SessionPrincipal user, String... permissions) {
         if (user.mustChangePassword()) throw new ApiException(403, "MUST_CHANGE_PASSWORD", "初始密码尚未修改，请先修改密码后再操作");
         if (user.permissions().contains("*")) return;

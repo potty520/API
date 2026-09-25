@@ -8,6 +8,7 @@ import com.example.ingestion.entity.*;
 import com.example.ingestion.mapper.*;
 import com.example.ingestion.service.AlertNotifier;
 import com.example.ingestion.ingest.ColumnCommenter;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.io.PrintWriter;
@@ -18,6 +19,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
+@Slf4j
 @Service
 public class SyncEngine {
     public record ExecuteOptions(String triggerType, boolean fullRefresh, String requestedBy) {}
@@ -158,7 +160,9 @@ public class SyncEngine {
         } catch (Exception error) {
             fail(run, task, response, attempts, started, error);
             if (error instanceof ApiException api) throw api;
-            throw new ApiException(500, error.getMessage() == null ? "任务执行失败" : error.getMessage());
+            // 详细原因与堆栈已写入执行记录, 不通过接口回显, 避免带出 SQL / 连接串等内部信息
+            log.error("任务 {} 执行失败, runNo={}", taskId, runNo, error);
+            throw new ApiException(500, "任务执行失败，详情请查看执行日志 " + runNo);
         } finally {
             running.remove(taskId);
         }
@@ -308,7 +312,9 @@ public class SyncEngine {
         run.setErrorMessage(error.getMessage()); run.setErrorStack(stack(error));
         run.setDetailJson(jsons.write(Map.of("exception", error.getClass().getName()))); runs.updateById(run);
         task.setStatus("失败"); task.setUpdatedAt(ended); tasks.updateById(task);
-        createAlert(task.getId(), run.getId(), "错误", "同步任务执行失败", error.getMessage() == null ? "未知异常" : error.getMessage());
+        String reason = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
+        if (reason.length() > 1000) reason = reason.substring(0, 1000) + "...";
+        createAlert(task.getId(), run.getId(), "错误", "同步任务执行失败", reason);
     }
 
     private void createAlert(Long taskId, Long runId, String level, String title, String message) {

@@ -67,3 +67,5 @@ app:
   secret-file: ${INGESTION_SECRET_FILE:data/.secret}
   token-hours: 8
   demo-url: http://127.0.0.1:${INGESTION_PORT:3100}/demo-api/orders?scenario=v1
+  # 内置演示接口是免鉴权的, 生产环境请设 INGESTION_DEMO_API=false 关闭
+  demo-api-enabled: ${INGESTION_DEMO_API:true}

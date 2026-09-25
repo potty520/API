@@ -1,5 +1,6 @@
 package com.example.ingestion.web;
 
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -12,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @RestController
 @RequestMapping("/demo-api")
+@ConditionalOnProperty(name = "app.demo-api-enabled", havingValue = "true", matchIfMissing = true)
 public class DemoController {
     private final Set<String> failedOnce = ConcurrentHashMap.newKeySet();
 
