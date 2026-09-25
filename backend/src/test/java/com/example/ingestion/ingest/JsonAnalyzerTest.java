@@ -53,6 +53,13 @@ class JsonAnalyzerTest {
     }
 
     @Test
+    void keepsBigintForValuesBeyondIntRange() {
+        JsonAnalyzer.Analysis analysis = analyzer.analyze(List.of(json("{\"small\":1,\"big\":12345678901}")));
+        assertEquals("integer", analysis.columns().get("small").type());
+        assertEquals("bigint", analysis.columns().get("big").type());
+    }
+
+    @Test
     void fallsBackToTextWhenTypesAreIncompatible() {
         JsonAnalyzer.Analysis analysis = analyzer.analyze(List.of(json("{\"v\":1}"), json("{\"v\":\"abc\"}")));
         assertEquals("text", analysis.columns().get("v").type());

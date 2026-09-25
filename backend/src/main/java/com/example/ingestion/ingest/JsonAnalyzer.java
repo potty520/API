@@ -196,7 +196,10 @@ public class JsonAnalyzer {
         if (node.isBoolean()) return node.booleanValue();
         if (node.isIntegralNumber()) {
             long value = node.longValue();
-            return value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE ? (int) value : value;
+            // 必须拆成两句: 三元表达式会做二元数值提升, "? (int) value : value" 的结果类型仍是 long,
+            // 会让所有整数字段都被推断成 bigint(INT 建表分支永远走不到)
+            if (value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE) return (int) value;
+            return value;
         }
         if (node.isFloatingPointNumber()) return node.decimalValue();
         String text = node.asText().trim();
