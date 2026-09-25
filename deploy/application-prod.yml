@@ -9,6 +9,17 @@
 #  生效: 修改后无需重新打包, 重启应用即可
 #  原理: 下面这些都是"顶层属性名", jar 内 application.yml 用 ${META_DB_URL:...} 之类
 #        的占位符引用它们, 所以能生效; 换任何别的名字都不会被读到
+#
+#  ⚠ 生效范围(重要):
+#    经 Spring 占位符引用, 写在本文件里就生效:
+#      META_DB_URL / META_DB_USER / META_DB_PASSWORD / INGESTION_SECRET_FILE
+#      INGESTION_PORT / SERVER_ADDRESS / INGESTION_DEMO_API
+#    代码里直接读 System.getenv(), **必须是真实环境变量**(systemd EnvironmentFile 或 export/setx),
+#    写在本 YAML 里不会生效:
+#      TARGET_DB_HOST/PORT/NAME/USER/PASSWORD / INGESTION_INIT_*_PASSWORD / INGESTION_SEED_DEMO
+#      INGESTION_ALLOW_PRIVATE_URLS / INGESTION_TRUST_PROXY
+#      INGESTION_ENV_VAR_PREFIX / INGESTION_MAX_RESPONSE_BYTES
+#    所以生产环境优先用方式一: deploy/json-ingestion.env.example + systemd EnvironmentFile
 # ============================================================
 
 # ---- 元数据库(必填: 替换生产库地址和密码) ----
@@ -51,3 +62,8 @@ INGESTION_SEED_DEMO: "false"
 
 # ---- 内置免鉴权演示接口 /demo-api(生产建议 false) ----
 INGESTION_DEMO_API: "false"
+
+# ---- 下面几项只能作为真实环境变量提供, 写在这里仅作文档留档(见文件头说明) ----
+# INGESTION_TRUST_PROXY=true            # 应用直接对外时改 false
+# INGESTION_ENV_VAR_PREFIX=INGESTION_VAR_  # 任务里 {{env.XXX}} 允许引用的变量前缀
+# INGESTION_MAX_RESPONSE_BYTES=33554432    # 单个响应体读取上限(字节)

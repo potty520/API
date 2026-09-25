@@ -21,12 +21,28 @@ import java.util.concurrent.TimeUnit;
 public class InterfaceHttpClient {
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final boolean ALLOW_PRIVATE_URLS = Boolean.parseBoolean(System.getenv().getOrDefault("INGESTION_ALLOW_PRIVATE_URLS", "false"));
+    /** {{env.XXX}} 只允许引用该前缀的环境变量, 避免把 META_DB_PASSWORD 之类拼进外发请求带走。 */
+    private static final String ENV_VAR_PREFIX = System.getenv().getOrDefault("INGESTION_ENV_VAR_PREFIX", "INGESTION_VAR_");
+    /** 单个响应体读取上限, 防止对端返回超大响应把内存打满。 */
+    private static final long MAX_RESPONSE_BYTES = maxResponseBytes();
     private record CachedToken(String token, Instant expiresAt) {}
     public record HttpResult(int status, long durationMs, JsonNode payload, String raw) {}
 
     private final Jsons jsons;
     private final CryptoService crypto;
     private final Map<Long, CachedToken> tokenCache = new ConcurrentHashMap<>();
+    /** 共享连接池/线程池; 每次调用用 newBuilder() 派生, 只覆盖超时, 避免每个请求都新建一个客户端。 */
+    private final OkHttpClient sharedClient = new OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(120, TimeUnit.SECONDS)
+            // 网络拦截器能看到每一跳(含重定向后)的真实请求, 堵住"外网地址 302 跳内网"的 SSRF 绕过
+            .addNetworkInterceptor(chain -> {
+                validateHop(chain.request().url());
+                return chain.proceed(chain.request());
+            })
+            .build();
 
     public InterfaceHttpClient(Jsons jsons, CryptoService crypto) {
         this.jsons = jsons;
@@ -71,7 +87,7 @@ public class InterfaceHttpClient {
         else request.get();
 
         int timeout = Math.max(1, Math.min(600, Optional.ofNullable(task.getTimeoutSec()).orElse(30)));
-        OkHttpClient client = new OkHttpClient.Builder()
+        OkHttpClient client = sharedClient.newBuilder()
                 .connectTimeout(timeout, TimeUnit.SECONDS)
                 .readTimeout(timeout, TimeUnit.SECONDS)
                 .writeTimeout(timeout, TimeUnit.SECONDS)
@@ -80,7 +96,7 @@ public class InterfaceHttpClient {
         long started = System.nanoTime();
         try (Response response = client.newCall(request.build()).execute()) {
             long duration = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
-            String raw = response.body() == null ? "" : response.body().string();
+            String raw = readBody(response.body());
             if (!response.isSuccessful()) {
                 throw new RemoteCallException(response.code(), duration, "接口返回 HTTP " + response.code() + ": " + redact(raw.substring(0, Math.min(raw.length(), 500))));
             }
@@ -102,8 +118,8 @@ public class InterfaceHttpClient {
         validateTargetUrl(tokenUrl);
         Map<String, Object> tokenBody = auth.get("tokenBody") instanceof Map<?, ?> map ? castMap(map) : Map.of();
         Request request = new Request.Builder().url(tokenUrl).post(RequestBody.create(jsons.write(tokenBody), JSON)).build();
-        try (Response response = new OkHttpClient.Builder().callTimeout(30, TimeUnit.SECONDS).build().newCall(request).execute()) {
-            String raw = response.body() == null ? "" : response.body().string();
+        try (Response response = sharedClient.newBuilder().callTimeout(30, TimeUnit.SECONDS).build().newCall(request).execute()) {
+            String raw = readBody(response.body());
             if (!response.isSuccessful()) throw new ApiException(422, "Token 刷新失败，HTTP " + response.code());
             JsonNode node = jsons.tree(raw);
             String tokenPath = String.valueOf(auth.getOrDefault("tokenPath", "access_token"));
@@ -132,18 +148,61 @@ public class InterfaceHttpClient {
         if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
             throw new ApiException(422, "出于安全考虑，接口地址仅支持 http/https 协议");
         }
+        if (!ALLOW_PRIVATE_URLS) {
+            String host = uri.getHost();
+            if (host == null || host.isBlank()) throw new ApiException(422, "接口 URL 缺少主机名");
+            validateHost(host);
+        }
+    }
+
+    /** 重定向后的每一跳都要重新校验, 否则公网地址 302 到 169.254.169.254 就能绕过防护。 */
+    private void validateHop(HttpUrl url) {
+        String scheme = url.scheme();
+        if (!"http".equals(scheme) && !"https".equals(scheme)) {
+            throw new ApiException(422, "出于安全考虑，接口地址仅支持 http/https 协议");
+        }
+        validateHost(url.host());
+    }
+
+    private void validateHost(String host) {
         if (ALLOW_PRIVATE_URLS) return;
-        String host = uri.getHost();
         if (host == null || host.isBlank()) throw new ApiException(422, "接口 URL 缺少主机名");
         try {
             InetAddress address = InetAddress.getByName(host);
-            if (address.isLoopbackAddress() || address.isAnyLocalAddress() || address.isLinkLocalAddress() || address.isSiteLocalAddress()) {
+            if (address.isLoopbackAddress() || address.isAnyLocalAddress() || address.isLinkLocalAddress()
+                    || address.isSiteLocalAddress() || address.isMulticastAddress()) {
                 throw new ApiException(422, "出于安全考虑，禁止访问本机或内网地址: " + host);
             }
         } catch (ApiException error) {
             throw error;
         } catch (Exception error) {
             throw new ApiException(422, "接口地址无法解析: " + host);
+        }
+    }
+
+    /** 边读边限流, 超过上限立即中止, 不把整个响应堆进内存。 */
+    private String readBody(ResponseBody body) throws java.io.IOException {
+        if (body == null) return "";
+        if (body.contentLength() > MAX_RESPONSE_BYTES) throw new ApiException(422, "接口响应超过上限 " + (MAX_RESPONSE_BYTES >> 20) + "MB, 已拒绝读取");
+        java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+        byte[] chunk = new byte[8192];
+        long total = 0;
+        try (java.io.InputStream in = body.byteStream()) {
+            int read;
+            while ((read = in.read(chunk)) != -1) {
+                total += read;
+                if (total > MAX_RESPONSE_BYTES) throw new ApiException(422, "接口响应超过上限 " + (MAX_RESPONSE_BYTES >> 20) + "MB, 已中止读取");
+                buffer.write(chunk, 0, read);
+            }
+        }
+        return buffer.toString(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static long maxResponseBytes() {
+        try {
+            return Math.max(1L << 20, Long.parseLong(System.getenv().getOrDefault("INGESTION_MAX_RESPONSE_BYTES", "33554432")));
+        } catch (RuntimeException ignored) {
+            return 32L << 20;
         }
     }
 
@@ -171,9 +230,16 @@ public class InterfaceHttpClient {
         String result = value.replace("{{now}}", now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")))
                 .replace("{{date}}", now.toLocalDate().toString())
                 .replace("{{last_success_time}}", task.getLastSuccessAt() == null ? "" : task.getLastSuccessAt().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("\\{\\{env\\.([A-Za-z_][A-Za-z0-9_]*)}}").matcher(result);
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("\\{\\{env\\.([A-Za-z_][A-Za-z0-9_]*)\\}\\}").matcher(result);
         StringBuffer buffer = new StringBuffer();
-        while (matcher.find()) matcher.appendReplacement(buffer, java.util.regex.Matcher.quoteReplacement(System.getenv().getOrDefault(matcher.group(1), "")));
+        while (matcher.find()) {
+            String name = matcher.group(1);
+            if (!name.startsWith(ENV_VAR_PREFIX)) {
+                throw new ApiException(422, "出于安全考虑, {{env." + name + "}} 只能引用以 " + ENV_VAR_PREFIX
+                        + " 开头的环境变量(前缀可用 INGESTION_ENV_VAR_PREFIX 调整)");
+            }
+            matcher.appendReplacement(buffer, java.util.regex.Matcher.quoteReplacement(System.getenv().getOrDefault(name, "")));
+        }
         matcher.appendTail(buffer);
         return buffer.toString();
     }

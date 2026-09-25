@@ -11,9 +11,11 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.Set;
 
 @Service
 public class CryptoService {
@@ -41,6 +43,17 @@ public class CryptoService {
         byte[] derived = java.security.MessageDigest.getInstance("SHA-256")
                 .digest((Base64.getEncoder().encodeToString(key) + "|audit-chain-v2").getBytes(StandardCharsets.UTF_8));
         auditKey = new SecretKeySpec(derived, "HmacSHA256");
+        restrictSecretFile();
+    }
+
+    /** 主密钥文件收紧为仅属主可读写; 非 POSIX 文件系统(Windows/NTFS)按部署文档的 ACL 步骤处理。 */
+    private void restrictSecretFile() {
+        try {
+            if (!secretFile.getFileSystem().supportedFileAttributeViews().contains("posix")) return;
+            Files.setPosixFilePermissions(secretFile, Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
+        } catch (Exception ignored) {
+            // 权限设置失败不影响启动, 由部署清单里的 ACL 检查兜底
+        }
     }
 
     /** 审计哈希链专用: 没有主密钥就无法重算出合法的 row_hash。 */

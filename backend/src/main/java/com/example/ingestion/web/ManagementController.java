@@ -383,11 +383,21 @@ public class ManagementController {
             for (int i = 0; i < headers.length; i++) {
                 if (i > 0) csv.append(',');
                 String camel = snakeToCamel(headers[i]);
-                csv.append('"').append(String.valueOf(row.getOrDefault(camel, "")).replace("\"", "\"\"")).append('"');
+                csv.append(csvCell(row.get(camel)));
             }
             csv.append("\r\n");
         }
         return ResponseEntity.ok().header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=execution-runs.csv").body(csv.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** 防 CSV 公式注入: 以 = + - @ 或制表符开头的单元格前置单引号, 避免在 Excel/WPS 里被当公式执行。 */
+    private static String csvCell(Object value) {
+        String text = String.valueOf(value == null ? "" : value).replace("\"", "\"\"");
+        if (!text.isEmpty()) {
+            char first = text.charAt(0);
+            if (first == '=' || first == '+' || first == '-' || first == '@' || first == '\t' || first == '\r') text = "'" + text;
+        }
+        return '"' + text + '"';
     }
 
     private DataSourceConfig normalizeSource(Map<String, Object> body, DataSourceConfig current) {

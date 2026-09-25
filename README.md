@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- GET/POST 接口，Header、Query、JSON Body 与动态参数（`{{now}}`/`{{date}}`/`{{last_success_time}}`/`{{env.XXX}}`）
+- GET/POST 接口，Header、Query、JSON Body 与动态参数（`{{now}}`/`{{date}}`/`{{last_success_time}}`/`{{env.INGESTION_VAR_*}}`）
 - Basic、表单登录、固定 Token、可刷新 Token 认证，敏感配置 AES-256-GCM 加密
 - JSON 根路径自动识别、嵌套对象扁平化、对象数组子表化、标量数组 JSON 化
 - 目标库适配：MySQL / PostgreSQL / SQL Server / Oracle
@@ -41,6 +41,8 @@
 | `INGESTION_TRUST_PROXY` | `true` | 是否采信回环反代传来的 `X-Forwarded-For`；应用直接对外时必须设 `false` |
 | `INGESTION_ALLOW_PRIVATE_URLS` | `false` | 是否允许任务访问内网/回环地址（SSRF 防护开关）；内置演示接口需要 `true` |
 | `INGESTION_DEMO_API` | `true` | 是否开放免鉴权的内置演示接口，生产环境设 `false` |
+| `INGESTION_ENV_VAR_PREFIX` | `INGESTION_VAR_` | 任务里 `{{env.XXX}}` 允许引用的环境变量前缀，防止把数据库密码等拼进外发请求 |
+| `INGESTION_MAX_RESPONSE_BYTES` | `33554432`（32MB） | 单个接口响应体读取上限，超限直接判失败 |
 
 ### 构建
 
@@ -95,7 +97,8 @@ start-system.cmd
 - 密码 BCrypt-11；敏感配置 AES-256-GCM，审计链使用从主密钥派生的独立子密钥
 - 接口鉴权默认拒绝（`anyRequest().authenticated()`），只放行登录、健康检查与（可关闭的）演示接口
 - 登录失败 10 次锁定 30 分钟；只有回环反代传来的 `X-Forwarded-For` 才被采信，客户端伪造的该头一律忽略
-- SSRF 防护：仅 http/https + 内网/回环/云元数据地址拦截（`INGESTION_ALLOW_PRIVATE_URLS` 放开）
+- SSRF 防护：仅 http/https + 内网/回环/云元数据地址拦截（`INGESTION_ALLOW_PRIVATE_URLS` 放开），重定向后的每一跳都会重新校验，响应体读取有大小上限
+- 任务动态参数 `{{env.XXX}}` 只能引用白名单前缀（默认 `INGESTION_VAR_`）的环境变量；CSV 导出对 `=`/`+`/`-`/`@` 开头的单元格做防公式注入处理
 - JDBC 连接串按方言做参数白名单校验，`autoDeserialize`/`socketFactory`/`allowLoadLocalInfile` 等可导致 RCE 或读本地文件的参数一律拒绝
 - 审计日志 HMAC-SHA256 哈希链（长度前缀规范化 + 链尾行锁）：`POST /api/audit/verify` 全链校验，`POST /api/audit/rechain` 仅管理员可触发且动作本身留痕告警
 - 错误信息脱敏（对外只回事件号，堆栈仅落库）；执行记录中的 Header/密钥字段回显时打码，回写时自动还原

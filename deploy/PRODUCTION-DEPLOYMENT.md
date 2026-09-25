@@ -63,6 +63,10 @@ sudo systemctl enable --now json-ingestion
 | `INGESTION_TRUST_PROXY` | true | 是否采信回环反代的 `X-Forwarded-For`; 直接对外时必须 false |
 | `INGESTION_ALLOW_PRIVATE_URLS` | false | 内网业务接口需要 true; 全公网接口保持 false(SSRF 防护更强) |
 | `INGESTION_DEMO_API` | true | 免鉴权的内置演示接口开关, 生产必须 false |
+| `INGESTION_ENV_VAR_PREFIX` | `INGESTION_VAR_` | 任务里 `{{env.XXX}}` 能引用的环境变量前缀, 防止敏感变量被拼进外发请求 |
+| `INGESTION_MAX_RESPONSE_BYTES` | 33554432 | 单个接口响应体读取上限(字节), 超限判失败 |
+
+> 注意: `TARGET_DB_*`、`INGESTION_INIT_*_PASSWORD`、`INGESTION_SEED_DEMO`、`INGESTION_ALLOW_PRIVATE_URLS`、`INGESTION_TRUST_PROXY`、`INGESTION_ENV_VAR_PREFIX`、`INGESTION_MAX_RESPONSE_BYTES` 由代码直接读取 `System.getenv()`, 必须是真实环境变量(systemd `EnvironmentFile` 或 export/setx); 写在外部 `application.yml` 里不会生效。
 
 ## 5. 调度持久化(已启用)
 
