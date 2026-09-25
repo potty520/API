@@ -1,6 +1,7 @@
 server:
   port: ${INGESTION_PORT:3100}
-  address: 127.0.0.1
+  # 默认只监听回环, 由 Nginx 反代对外; 确需直接监听网卡时用 SERVER_ADDRESS=0.0.0.0 覆盖
+  address: ${SERVER_ADDRESS:127.0.0.1}
   servlet:
     encoding:
       charset: UTF-8

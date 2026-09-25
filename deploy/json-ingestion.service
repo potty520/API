@@ -1,36 +1,38 @@
 [Unit]
 Description=JSON Ingestion System
-Documentation=https://github.com/example/json-ingestion-system
-After=network.target mysql.service
-Wants=mysql.service
+Documentation=https://github.com/potty520/API
+After=network-online.target mysqld.service
+Wants=network-online.target
+# 重启风暴保护
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=ingestion
 Group=ingestion
 WorkingDirectory=/opt/json-ingestion-system
-# ????: ????????/????, ????????
-Environment=META_DB_URL=jdbc:mysql://127.0.0.1:3306/json_ingestion?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
-Environment=META_DB_USER=json_ingestion
-Environment=META_DB_PASSWORD=${META_DB_PASSWORD}
-Environment=TARGET_DB_HOST=127.0.0.1
-Environment=TARGET_DB_PORT=3306
-Environment=TARGET_DB_NAME=json_ingestion_target
-Environment=TARGET_DB_USER=json_ingestion
-Environment=TARGET_DB_PASSWORD=${META_DB_PASSWORD}
-Environment=INGESTION_SECRET_FILE=/opt/json-ingestion-system/data/.secret
-# ????????? true; ??????????? false(SSRF ????)
-Environment=INGESTION_ALLOW_PRIVATE_URLS=true
-ExecStart=/usr/bin/java -jar /opt/json-ingestion-system/json-ingestion-system-1.0.0.jar
+# 注意: systemd 的 Environment= 不会展开 ${VAR}, 写在这里只会得到字面量字符串。
+# 所有密钥类变量统一放在下面这个 0600 的 env 文件里(模板见 json-ingestion.env.example)。
+EnvironmentFile=/opt/json-ingestion-system/config/json-ingestion.env
+ExecStart=/usr/bin/java -XX:MaxRAMPercentage=75 -jar /opt/json-ingestion-system/json-ingestion-system-1.0.0.jar
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
-# ????
+
+# 加固
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunnels=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/opt/json-ingestion-system
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

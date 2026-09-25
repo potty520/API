@@ -2,6 +2,7 @@ package com.example.ingestion.ingest;
 
 import com.example.ingestion.common.Hashing;
 import com.example.ingestion.common.Jsons;
+import com.example.ingestion.common.JdbcUrlGuard;
 import com.example.ingestion.entity.DataSourceConfig;
 import com.example.ingestion.security.CryptoService;
 
@@ -264,16 +265,31 @@ public class TargetDatabase implements AutoCloseable {
     }
 
     private String jdbcUrl() {
-        if (profile.getJdbcUrl() != null && !profile.getJdbcUrl().isBlank()) return profile.getJdbcUrl();
-        String host = profile.getHost();
+        String configured = trim(profile.getJdbcUrl());
+        String url = configured.isBlank() ? buildJdbcUrl() : configured;
+        // 存量数据源可能写于校验上线之前; optionsJson 也会被拼进 URL, 因此对最终串统一校验
+        JdbcUrlGuard.validateUrl(dialect, url);
+        JdbcUrlGuard.validateHostParts(profile.getHost(), profile.getPort(), profile.getDatabaseName(),
+                profile.getSchemaName(), profile.getServiceName());
+        return url;
+    }
+
+    private String buildJdbcUrl() {
+        String host = trim(profile.getHost());
+        String database = trim(profile.getDatabaseName());
+        String serviceName = trim(profile.getServiceName());
         int port = profile.getPort() == null ? defaultPort() : profile.getPort();
         return switch (dialect) {
-            case "mysql" -> "jdbc:mysql://" + host + ":" + port + "/" + profile.getDatabaseName() + "?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false";
-            case "postgres" -> "jdbc:postgresql://" + host + ":" + port + "/" + profile.getDatabaseName();
-            case "sqlserver" -> "jdbc:sqlserver://" + host + ":" + port + ";databaseName=" + profile.getDatabaseName() + ";encrypt=" + option("encrypt", "false") + ";trustServerCertificate=" + option("trustServerCertificate", "true");
-            case "oracle" -> "jdbc:oracle:thin:@//" + host + ":" + port + "/" + (profile.getServiceName() == null || profile.getServiceName().isBlank() ? profile.getDatabaseName() : profile.getServiceName());
+            case "mysql" -> "jdbc:mysql://" + host + ":" + port + "/" + database + "?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false";
+            case "postgres" -> "jdbc:postgresql://" + host + ":" + port + "/" + database;
+            case "sqlserver" -> "jdbc:sqlserver://" + host + ":" + port + ";databaseName=" + database + ";encrypt=" + option("encrypt", "false") + ";trustServerCertificate=" + option("trustServerCertificate", "true");
+            case "oracle" -> "jdbc:oracle:thin:@//" + host + ":" + port + "/" + (serviceName.isBlank() ? database : serviceName);
             default -> throw new IllegalArgumentException("不支持的数据源类型: " + dialect);
         };
+    }
+
+    private static String trim(String value) {
+        return value == null ? "" : value.trim();
     }
 
     private String option(String key, String fallback) {

@@ -1,28 +1,50 @@
-﻿# ============================================================
-#  生产环境外部配置模板
-#  用法: 放到 jar 同目录的 config/ 下, 如 /opt/app/config/application.yml
-#  修改后无需重新打包, 重启应用即生效
-#  优先级: 命令行参数 > 环境变量 > 本文件 > jar 内配置
+# ============================================================
+#  生产环境外部配置模板(方式二: 外部 application.yml)
+#
+#  推荐方式是 systemd EnvironmentFile(见 json-ingestion.env.example),
+#  因为它能做到 0600 权限且不与 YAML 混在一起。本文件用于不方便用 systemd 的场景。
+#
+#  用法: 放到 jar 同目录的 config/ 下, 如 /opt/json-ingestion-system/config/application.yml
+#        并执行 chmod 600 (文件里含明文数据库密码)
+#  生效: 修改后无需重新打包, 重启应用即可
+#  原理: 下面这些都是"顶层属性名", jar 内 application.yml 用 ${META_DB_URL:...} 之类
+#        的占位符引用它们, 所以能生效; 换任何别的名字都不会被读到
 # ============================================================
 
-# 元数据库连接(必填: 替换生产库 IP 和密码)
-META_DB_URL: jdbc:mysql://生产库IP:3306/json_ingestion?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+# ---- 元数据库(必填: 替换生产库地址和密码) ----
+META_DB_URL: jdbc:mysql://127.0.0.1:3306/json_ingestion?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
 META_DB_USER: json_ingestion
 META_DB_PASSWORD: 生产库密码
 
-# 首次种子目标库连接(应用自动建目标表用)
-TARGET_DB_HOST: 生产库IP
+# ---- 首次启动播种的目标库(应用会在这里自动建表) ----
+TARGET_DB_HOST: 127.0.0.1
 TARGET_DB_PORT: 3306
 TARGET_DB_NAME: json_ingestion_target
 TARGET_DB_USER: json_ingestion
 TARGET_DB_PASSWORD: 生产库密码
 
-# AES 主密钥文件(首次启动自动生成, 必须纳入备份; 迁移时连同 SQL 一起拷贝)
-INGESTION_SECRET_FILE: /opt/app/data/.secret
+# ---- AES 主密钥文件(首次启动自动生成, 必须纳入备份; 迁移时连同 SQL 一起拷贝) ----
+INGESTION_SECRET_FILE: /opt/json-ingestion-system/data/.secret
 
-# SSRF 防护开关: 接口全公网设 false(更安全); 有内网业务接口设 true
+# ---- SSRF 防护开关: 接口全公网设 false(更安全); 有内网业务接口设 true ----
 INGESTION_ALLOW_PRIVATE_URLS: "true"
 
-# HTTP 端口与监听地址
+# ---- HTTP 端口与监听地址 ----
+# 有 Nginx 反代时保持 127.0.0.1; 确需应用直接对外时才改 0.0.0.0
 INGESTION_PORT: 3100
-SERVER_ADDRESS: 0.0.0.0
+SERVER_ADDRESS: 127.0.0.1
+
+# ---- 反向代理 ----
+# 应用只监听回环、由本机 Nginx 反代时保持 true, 审计日志才能记录真实客户端 IP;
+# 应用直接对外时必须设 false, 否则客户端可伪造 X-Forwarded-For
+INGESTION_TRUST_PROXY: "true"
+
+# ---- 首次启动的初始账号密码 ----
+# 留空则生成一次性随机密码, 只在启动日志输出一次; 所有初始账号首次登录强制改密
+INGESTION_INIT_ADMIN_PASSWORD: ""
+INGESTION_INIT_CONFIG_PASSWORD: ""
+INGESTION_INIT_RUNNER_PASSWORD: ""
+INGESTION_INIT_VIEWER_PASSWORD: ""
+
+# ---- 是否播种演示任务(生产建议 false) ----
+INGESTION_SEED_DEMO: "false"

@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.example.ingestion.common.ApiException;
 import com.example.ingestion.common.Jsons;
+import com.example.ingestion.common.JdbcUrlGuard;
 import com.example.ingestion.entity.*;
 import com.example.ingestion.ingest.JsonAnalyzer;
 import com.example.ingestion.ingest.SyncEngine;
@@ -384,6 +385,9 @@ public class ManagementController {
         source.setLastTestMessage(current == null ? "" : current.getLastTestMessage());
         source.setCreatedAt(current == null ? now : current.getCreatedAt()); source.setUpdatedAt(now);
         if (source.getJdbcUrl().isBlank() && (source.getHost().isBlank() || source.getUsername().isBlank())) throw new ApiException(422, "主机地址和用户名不能为空");
+        // 连接串在保存时就拦下, 避免把可触发驱动侧 RCE / 本地文件读取的参数写进库
+        JdbcUrlGuard.validate(type, source.getJdbcUrl(), source.getHost(), source.getPort(),
+                source.getDatabaseName(), source.getSchemaName(), source.getServiceName());
         return source;
     }
 
