@@ -119,6 +119,13 @@ public class AuthService {
         return principal;
     }
 
+    /** 仅要求已登录且已完成初始改密, 不校验具体权限。 */
+    public SessionPrincipal authenticated() {
+        SessionPrincipal principal = current();
+        rejectIfMustChangePassword(principal);
+        return principal;
+    }
+
     /** 校验单个权限; 初始密码未修改时, 除改密接口外一律拒绝。 */
     public SessionPrincipal require(String permission) {
         SessionPrincipal principal = current();

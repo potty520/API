@@ -28,6 +28,10 @@ import java.util.*;
 @RestController
 @RequestMapping("/api")
 public class ManagementController {
+    /** 仅管理员可改的系统参数: 它们决定外发地址或会进入建表语句的文本。 */
+    private static final Set<String> ADMIN_ONLY_SETTINGS = Set.of(
+            "alert_webhook_url", "ollama_url", "ollama_model", "comment_translate_enabled", "field_comment_map");
+
     private final AuthService auth;
     private final AuditService audit;
     private final CryptoService crypto;
@@ -68,6 +72,7 @@ public class ManagementController {
         stats.put("running", engine.runningTaskIds().size());
         stats.put("failed", taskList.stream().filter(item -> List.of("失败", "Cron无效").contains(item.getStatus())).count());
         stats.put("pendingKey", taskList.stream().filter(item -> "待配置主键".equals(item.getStatus())).count());
+        stats.put("schedulerEnabled", scheduler.globallyEnabled());
         Map<String, Object> today = new LinkedHashMap<>();
         today.put("runs", todayRuns.size());
         today.put("success", todayRuns.stream().filter(item -> "成功".equals(item.getStatus())).count());
@@ -81,7 +86,7 @@ public class ManagementController {
 
     @GetMapping("/groups")
     public Map<String, Object> groups() {
-        auth.current();
+        auth.authenticated();
         return Map.of("items", groups.selectList(Wrappers.<TaskGroup>lambdaQuery().orderByAsc(TaskGroup::getName)));
     }
 
@@ -141,7 +146,7 @@ public class ManagementController {
 
     @PostMapping("/cron/validate")
     public ResponseEntity<Map<String, Object>> validateCron(@RequestBody Map<String, Object> body) {
-        auth.current();
+        auth.authenticated();
         try {
             String normalized = CronSupport.normalize(string(body.get("expression")));
             List<LocalDateTime> next = CronSupport.nextRuns(normalized, 3);
@@ -174,7 +179,7 @@ public class ManagementController {
 
     @GetMapping("/tasks/{id}")
     public Map<String, Object> taskDetail(@PathVariable Long id) {
-        auth.current();
+        auth.authenticated();
         InterfaceTask task = requireTask(id);
         Map<String, Object> item = publicTask(task);
         Map<String, Object> authConfig = jsons.map(crypto.decrypt(task.getAuthJsonEnc()));
@@ -281,7 +286,8 @@ public class ManagementController {
 
     @PatchMapping("/alerts/{id}/resolve")
     public Map<String, Object> resolveAlert(@PathVariable Long id) {
-        auth.require("logs");
+        // 处理告警是写操作, 只读的查看员角色不应拥有
+        auth.require("execute");
         AlertRecord alert = alerts.selectById(id);
         if (alert == null) throw new ApiException(404, "告警不存在");
         alert.setStatus("已处理"); alert.setResolvedAt(LocalDateTime.now()); alerts.updateById(alert);
@@ -303,18 +309,33 @@ public class ManagementController {
         SessionPrincipal user = auth.require("settings");
         Object values = body.get("settings");
         if (!(values instanceof Map<?, ?> map)) throw new ApiException(422, "settings 必须是对象");
+        boolean admin = user.permissions().contains("*");
+        List<String> changed = new ArrayList<>();
         for (Map.Entry<?, ?> entry : map.entrySet()) {
-            SystemSetting setting = settings.selectById(String.valueOf(entry.getKey()));
+            String key = String.valueOf(entry.getKey());
+            SystemSetting setting = settings.selectById(key);
             if (setting == null) continue;
-            setting.setSettingValue(String.valueOf(entry.getValue())); setting.setUpdatedAt(LocalDateTime.now()); settings.updateById(setting);
+            String next = entry.getValue() == null ? "" : String.valueOf(entry.getValue());
+            if (Objects.equals(setting.getSettingValue(), next)) continue;
+            if (!admin && ADMIN_ONLY_SETTINGS.contains(key)) {
+                throw new ApiException(403, "参数 " + key + " 会影响外发地址或建表语句，仅管理员可修改");
+            }
+            setting.setSettingValue(next);
+            setting.setUpdatedAt(LocalDateTime.now());
+            settings.updateById(setting);
+            changed.add(key);
         }
-        audit.record(user, "修改系统参数", "系统管理", map.keySet().toString(), ip(request));
-        return Map.of("ok", true);
+        if (!changed.isEmpty()) {
+            audit.record(user, "修改系统参数", "系统管理", changed.toString(), ip(request));
+            // 调度总开关必须立即作用到已注册的触发器, 否则关不掉
+            if (changed.contains("scheduler_enabled")) scheduler.applyGlobalSwitch(user.username());
+        }
+        return Map.of("ok", true, "changed", changed);
     }
 
     @GetMapping("/audit/list")
     public Map<String, Object> auditList(@RequestParam(defaultValue = "100") int limit) {
-        auth.require("settings");
+        auth.requireAdmin();
         int safeLimit = Math.max(1, Math.min(limit <= 0 ? 100 : limit, 500));
         List<Map<String, Object>> items = audits.selectList(Wrappers.<AuditLog>lambdaQuery().orderByDesc(AuditLog::getId).last("LIMIT " + safeLimit)).stream().map(this::bean).toList();
         return Map.of("items", items, "total", audits.selectCount(null));
@@ -322,7 +343,7 @@ public class ManagementController {
 
     @PostMapping("/audit/verify")
     public Map<String, Object> auditVerify() {
-        auth.require("settings");
+        auth.requireAdmin();
         String broken = audit.verifyChain();
         return Map.of("valid", broken == null, "error", broken == null ? "" : broken);
     }
@@ -457,7 +478,12 @@ public class ManagementController {
     private int clamp(int value, int min, int max) { return Math.max(min, Math.min(max, value)); }
     private Map<String, Object> stringMap(Map<?, ?> source) { Map<String, Object> result = new LinkedHashMap<>(); source.forEach((key, value) -> result.put(String.valueOf(key), value)); return result; }
     private String ip(HttpServletRequest request) { String forwarded = request.getHeader("X-Forwarded-For"); return forwarded == null ? request.getRemoteAddr() : forwarded.split(",")[0].trim(); }
-    private void requireAny(SessionPrincipal user, String... permissions) { if (user.permissions().contains("*")) return; for (String permission : permissions) if (user.permissions().contains(permission)) return; throw new ApiException(403, "当前角色没有该操作权限"); }
+    private void requireAny(SessionPrincipal user, String... permissions) {
+        if (user.mustChangePassword()) throw new ApiException(403, "MUST_CHANGE_PASSWORD", "初始密码尚未修改，请先修改密码后再操作");
+        if (user.permissions().contains("*")) return;
+        for (String permission : permissions) if (user.permissions().contains(permission)) return;
+        throw new ApiException(403, "当前角色没有该操作权限");
+    }
     private long sum(List<ExecutionRun> values, java.util.function.Function<ExecutionRun, Long> field) { return values.stream().map(field).filter(Objects::nonNull).mapToLong(Long::longValue).sum(); }
     private String snakeToCamel(String value) { StringBuilder out = new StringBuilder(); boolean upper = false; for (char c : value.toCharArray()) { if (c == '_') upper = true; else { out.append(upper ? Character.toUpperCase(c) : c); upper = false; } } return out.toString(); }
 }

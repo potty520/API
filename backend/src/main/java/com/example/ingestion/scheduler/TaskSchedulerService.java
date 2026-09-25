@@ -1,6 +1,7 @@
 package com.example.ingestion.scheduler;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.example.ingestion.common.ApiException;
 import com.example.ingestion.entity.InterfaceTask;
 import com.example.ingestion.entity.SystemSetting;
 import com.example.ingestion.mapper.InterfaceTaskMapper;
@@ -41,6 +42,34 @@ public class TaskSchedulerService {
                 log.error("Failed to restore task {} schedule", task.getId(), error);
             }
         });
+        // 重启后恢复调度总开关的真实状态
+        try {
+            if (!globallyEnabled()) {
+                scheduler.pauseAll();
+                log.warn("全局调度开关为关闭状态, 已暂停全部触发器");
+            }
+        } catch (SchedulerException error) {
+            log.error("恢复全局调度开关状态失败", error);
+        }
+    }
+
+    /**
+     * 全局调度开关变更后立即生效。
+     * 关闭时暂停所有触发器; 打开时重新注册启用中的任务(开关关闭期间保存的任务没有触发器), 再整体恢复。
+     */
+    public void applyGlobalSwitch(String operator) {
+        try {
+            if (globallyEnabled()) {
+                reconcile();
+                scheduler.resumeAll();
+                log.info("全局调度已恢复, 操作人 {}", operator);
+            } else {
+                scheduler.pauseAll();
+                log.warn("全局调度已暂停, 所有触发器停止触发, 操作人 {}", operator);
+            }
+        } catch (SchedulerException error) {
+            throw new ApiException(500, "调度开关切换失败");
+        }
     }
 
     public void schedule(InterfaceTask task) throws SchedulerException {

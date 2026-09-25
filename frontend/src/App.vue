@@ -154,8 +154,8 @@
 
         <template v-else-if="page === 'settings'">
           <div class="settings-grid">
-            <section class="panel"><div class="panel-header"><div><h2>系统参数</h2><p>调度与入库策略</p></div></div><el-form class="settings-form" label-width="150px"><el-form-item v-for="setting in settingsData.items" :key="setting.settingKey" :label="setting.description"><el-input v-model="settingsForm[setting.settingKey]" /></el-form-item><el-form-item><el-button type="primary" @click="saveSettings">保存参数</el-button></el-form-item></el-form></section>
-            <section class="panel"><div class="panel-header"><div><h2>角色账号</h2><p>权限隔离</p></div></div><el-table :data="settingsData.users"><el-table-column prop="username" label="账号" /><el-table-column prop="displayName" label="姓名" /><el-table-column prop="roleName" label="角色" /><el-table-column label="状态"><template #default="{ row }"><el-tag :type="row.active ? 'success' : 'info'">{{ row.active ? '启用' : '禁用' }}</el-tag></template></el-table-column></el-table></section>
+            <section class="panel"><div class="panel-header"><div><h2>系统参数</h2><p>调度与入库策略</p></div></div><el-form class="settings-form" label-width="150px"><el-form-item v-for="setting in settingsData.items" :key="setting.settingKey" :label="setting.description"><el-input v-model="settingsForm[setting.settingKey]" :disabled="!canEditSetting(setting.settingKey)" /><span v-if="!canEditSetting(setting.settingKey)" class="field-note">涉及外发地址或建表语句，仅管理员可修改</span></el-form-item><el-form-item><el-button type="primary" @click="saveSettings">保存参数</el-button></el-form-item></el-form></section>
+            <section class="panel"><div class="panel-header"><div><h2>角色账号</h2><p>权限隔离</p></div></div><el-table :data="settingsData.users"><el-table-column prop="username" label="账号" /><el-table-column prop="displayName" label="姓名" /><el-table-column prop="roleName" label="角色" /><el-table-column label="状态"><template #default="{ row }"><el-tag :type="row.active ? 'success' : 'info'">{{ row.active ? '启用' : '禁用' }}</el-tag><el-tag v-if="row.mustChangePassword" type="warning" size="small">待改密</el-tag></template></el-table-column><el-table-column v-if="can('*')" label="操作" width="110"><template #default="{ row }"><el-button size="small" text type="primary" @click="resetUserPassword(row)">重置密码</el-button></template></el-table-column></el-table></section>
           </div>
           <div class="section-title"><div><h2>审计日志</h2><p>配置与执行操作</p></div></div>
           <el-table :data="settingsData.audits" stripe><el-table-column prop="username" label="用户" width="100" /><el-table-column prop="actionName" label="操作" min-width="150" /><el-table-column prop="moduleName" label="模块" width="110" /><el-table-column prop="detailText" label="详情" min-width="220" /><el-table-column label="时间" min-width="165"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column></el-table>
@@ -244,6 +244,21 @@ const pages = [
 const navGroups = computed(() => [...new Set(pages.map(item => item.group))].map(name => ({ name, items: pages.filter(item => item.group === name && can(item.permission)) })).filter(group => group.items.length))
 const currentPage = computed(() => pages.find(item => item.key === page.value) || pages[0])
 function can(permission) { return !permission || user.value?.permissions?.includes('*') || user.value?.permissions?.includes(permission) }
+
+// 与后端 ManagementController.ADMIN_ONLY_SETTINGS 保持一致
+const ADMIN_ONLY_SETTINGS = ['alert_webhook_url', 'ollama_url', 'ollama_model', 'comment_translate_enabled', 'field_comment_map']
+function canEditSetting(key) { return can('*') || !ADMIN_ONLY_SETTINGS.includes(key) }
+async function resetUserPassword(row) {
+  try {
+    const { value } = await ElMessageBox.prompt(`为 ${row.username} 设置新密码，该账号下次登录必须再次修改`, '重置密码', {
+      confirmButtonText: '确认重置', cancelButtonText: '取消', inputType: 'password',
+      inputValidator: input => (input && input.length >= 8 && /[A-Za-z]/.test(input) && /\d/.test(input)) || '至少 8 位且同时包含字母和数字'
+    })
+    await api('/api/password/reset', { method: 'POST', body: JSON.stringify({ username: row.username, newPassword: value }) })
+    ElMessage.success('密码已重置')
+    await loadSettings()
+  } catch (error) { if (error !== 'cancel' && error !== 'close') handleApiError(error) }
+}
 
 const dashboard = reactive({ stats: {}, today: {}, recent: [], alerts: [] })
 const successRate = computed(() => dashboard.today.runs ? ((dashboard.today.success || 0) * 100 / dashboard.today.runs).toFixed(1) : '100.0')

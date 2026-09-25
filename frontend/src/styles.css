@@ -59,6 +59,7 @@ button, input, textarea, select { font: inherit; }
 .sidebar-actions { display: flex; align-items: center; gap: 2px; }
 .sidebar-actions .el-button { margin: 0; }
 .dialog-hint { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.field-note { display: block; color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 2px; }
 
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 224px minmax(0, 1fr); }
 .sidebar {
