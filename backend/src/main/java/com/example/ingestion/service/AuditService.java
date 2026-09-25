@@ -1,6 +1,5 @@
 package com.example.ingestion.service;
 
-import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.example.ingestion.common.Hashing;
 import com.example.ingestion.entity.AuditLog;
 import com.example.ingestion.mapper.AuditLogMapper;
@@ -68,7 +67,7 @@ public class AuditService {
 
     /** 校验审计链完整性。返回 null 表示完整, 否则返回断裂点描述。 */
     public String verifyChain() {
-        List<AuditLog> entries = mapper.selectList(Wrappers.<AuditLog>lambdaQuery().orderByAsc(AuditLog::getId));
+        List<AuditLog> entries = mapper.selectAllOrdered();
         String expectedPrev = "";
         for (AuditLog entry : entries) {
             String actualPrev = entry.getPrevHash() == null ? "" : entry.getPrevHash();
@@ -94,7 +93,7 @@ public class AuditService {
      * 该操作会抹掉篡改痕迹, 只能由管理员显式触发, 生产环境需双人确认。
      */
     public synchronized int rechain() {
-        List<AuditLog> entries = mapper.selectList(Wrappers.<AuditLog>lambdaQuery().orderByAsc(AuditLog::getId));
+        List<AuditLog> entries = mapper.selectAllOrdered();
         int updated = 0;
         String previous = "";
         for (AuditLog entry : entries) {
