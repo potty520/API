@@ -352,7 +352,25 @@ public class ManagementController {
     public Map<String, Object> auditVerify() {
         auth.requireAdmin();
         String broken = audit.verifyChain();
-        return Map.of("valid", broken == null, "error", broken == null ? "" : broken);
+        return Map.of("valid", broken == null, "error", broken == null ? "" : broken, "checked", audit.count());
+    }
+
+    /** 重建审计链会抹掉篡改痕迹, 因此仅限管理员显式触发, 并且动作本身留痕 + 产生高危告警。 */
+    @PostMapping("/audit/rechain")
+    public Map<String, Object> auditRechain(HttpServletRequest request) {
+        SessionPrincipal user = auth.requireAdmin();
+        int updated = audit.rechain();
+        audit.record(user, "重建审计哈希链", "系统安全", "重写 " + updated + " 条记录的 prev_hash/row_hash", ip(request));
+        if (updated > 0) {
+            AlertRecord alert = new AlertRecord();
+            alert.setLevelName("高危");
+            alert.setTitle("审计哈希链被重建");
+            alert.setMessage("管理员 " + user.username() + " 触发重链，重写 " + updated + " 条记录。若非计划内操作请立即排查篡改来源。");
+            alert.setStatus("未处理");
+            alert.setCreatedAt(LocalDateTime.now());
+            alerts.insert(alert);
+        }
+        return Map.of("ok", true, "updated", updated);
     }
     @GetMapping(value = "/export/runs", produces = "text/csv;charset=UTF-8")
     public ResponseEntity<byte[]> exportRuns() {

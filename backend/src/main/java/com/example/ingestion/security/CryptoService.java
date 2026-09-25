@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import javax.crypto.Cipher;
+import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
@@ -12,12 +13,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.HexFormat;
 
 @Service
 public class CryptoService {
     private final SecureRandom random = new SecureRandom();
     private final Path secretFile;
     private byte[] key;
+    private SecretKeySpec auditKey;
 
     public CryptoService(@Value("${app.secret-file:data/.secret}") String secretFile) {
         this.secretFile = Path.of(secretFile).toAbsolutePath().normalize();
@@ -34,6 +37,21 @@ public class CryptoService {
             Files.writeString(secretFile, Base64.getEncoder().encodeToString(key));
         }
         if (key.length != 32) throw new IllegalStateException("加密主密钥必须为 32 字节");
+        // 审计链签名使用从主密钥派生的独立子密钥, 与配置加密密钥隔离
+        byte[] derived = java.security.MessageDigest.getInstance("SHA-256")
+                .digest((Base64.getEncoder().encodeToString(key) + "|audit-chain-v2").getBytes(StandardCharsets.UTF_8));
+        auditKey = new SecretKeySpec(derived, "HmacSHA256");
+    }
+
+    /** 审计哈希链专用: 没有主密钥就无法重算出合法的 row_hash。 */
+    public String hmacSha256Hex(String text) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(auditKey);
+            return HexFormat.of().formatHex(mac.doFinal((text == null ? "" : text).getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception error) {
+            throw new IllegalStateException("审计链签名失败", error);
+        }
     }
 
     public String encrypt(String plain) {
