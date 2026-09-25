@@ -24,6 +24,7 @@ export async function api(path, options = {}) {
   if (!response.ok) {
     const error = new Error(body?.error || body || '请求失败')
     error.status = response.status
+    error.code = typeof body === 'object' && body !== null ? body.code || '' : ''
     throw error
   }
   return body
@@ -31,7 +32,15 @@ export async function api(path, options = {}) {
 
 export async function download(path, filename) {
   const response = await fetch(path, { headers: { Authorization: `Bearer ${getToken()}` } })
-  if (!response.ok) throw new Error((await response.json()).error || '导出失败')
+  if (!response.ok) {
+    // 失败响应可能不是 JSON(例如反代返回的 HTML 错误页), 不能直接 json()
+    const text = await response.text()
+    let message = ''
+    try { message = JSON.parse(text)?.error || '' } catch { message = '' }
+    const error = new Error(message || `导出失败 (HTTP ${response.status})`)
+    error.status = response.status
+    throw error
+  }
   const blob = await response.blob()
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')

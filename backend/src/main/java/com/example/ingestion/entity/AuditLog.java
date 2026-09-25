@@ -19,4 +19,5 @@ public class AuditLog {
     private LocalDateTime createdAt;
     private String prevHash;
     private String rowHash;
+    private Integer chainVersion;
 }

@@ -19,12 +19,7 @@
         <el-form-item label="账号"><el-input v-model="loginForm.username" autocomplete="username" /></el-form-item>
         <el-form-item label="密码"><el-input v-model="loginForm.password" type="password" show-password autocomplete="current-password" @keyup.enter="login" /></el-form-item>
         <el-button type="primary" :loading="loginLoading" @click="login">登录</el-button>
-        <div class="quick-accounts">
-          <span>角色账号</span>
-          <div class="account-buttons">
-            <el-button v-for="account in accounts" :key="account.username" size="small" @click="fillAccount(account)">{{ account.label }}</el-button>
-          </div>
-        </div>
+        <p class="login-hint">初始账号密码由部署时的环境变量指定，或在首次启动日志中一次性输出。</p>
       </el-form>
     </section>
   </div>
@@ -46,7 +41,10 @@
       <div class="sidebar-user">
         <span class="avatar">{{ user.displayName.slice(0, 1) }}</span>
         <div><strong>{{ user.displayName }}</strong><span>{{ user.role }}</span></div>
-        <el-button text circle title="退出登录" @click="logout"><el-icon><SwitchButton /></el-icon></el-button>
+        <div class="sidebar-actions">
+          <el-button text circle title="修改密码" @click="openPasswordDialog"><el-icon><Key /></el-icon></el-button>
+          <el-button text circle title="退出登录" @click="logout"><el-icon><SwitchButton /></el-icon></el-button>
+        </div>
       </div>
     </aside>
 
@@ -191,6 +189,20 @@
     <el-dialog v-model="runDetailVisible" title="执行日志详情" width="760px">
       <template v-if="runDetail"><div class="summary-grid"><div class="summary-item"><span>状态</span><strong><el-tag :type="statusType(runDetail.status)">{{ runDetail.status }}</el-tag></strong></div><div class="summary-item"><span>同步模式</span><strong>{{ runDetail.syncMode }}</strong></div><div class="summary-item"><span>尝试次数</span><strong>{{ runDetail.attemptCount }}</strong></div><div class="summary-item"><span>HTTP / 响应</span><strong>{{ runDetail.httpStatus || '-' }} / {{ runDetail.responseMs }}ms</strong></div></div><div class="section-title"><h2>数据统计</h2></div><div class="summary-grid"><div class="summary-item"><span>拉取</span><strong>{{ runDetail.totalCount }}</strong></div><div class="summary-item"><span>新增</span><strong>{{ runDetail.insertedCount }}</strong></div><div class="summary-item"><span>更新</span><strong>{{ runDetail.updatedCount }}</strong></div><div class="summary-item"><span>跳过</span><strong>{{ runDetail.skippedCount }}</strong></div></div><div class="section-title"><h2>结构变更</h2></div><pre class="code-block">{{ pretty(runDetail.schemaChanges) }}</pre><template v-if="runDetail.errorMessage"><div class="section-title"><h2>异常详情</h2></div><el-alert :title="runDetail.errorMessage" type="error" :closable="false" /><pre v-if="runDetail.errorStack" class="code-block">{{ runDetail.errorStack }}</pre></template></template>
     </el-dialog>
+
+    <el-dialog v-model="passwordDialogVisible" :title="mustChangePassword ? '首次登录必须修改密码' : '修改密码'" width="460px"
+               :close-on-click-modal="false" :close-on-press-escape="!mustChangePassword" :show-close="!mustChangePassword">
+      <el-form label-position="top" @submit.prevent="submitPasswordChange">
+        <el-form-item label="原密码"><el-input v-model="passwordForm.oldPassword" type="password" show-password autocomplete="current-password" /></el-form-item>
+        <el-form-item label="新密码"><el-input v-model="passwordForm.newPassword" type="password" show-password autocomplete="new-password" /></el-form-item>
+        <el-form-item label="确认新密码"><el-input v-model="passwordForm.confirmPassword" type="password" show-password autocomplete="new-password" @keyup.enter="submitPasswordChange" /></el-form-item>
+        <p class="dialog-hint">至少 8 位，且必须同时包含字母和数字。修改成功后当前浏览器自动续用新会话，其他设备需重新登录。</p>
+      </el-form>
+      <template #footer>
+        <el-button v-if="!mustChangePassword" @click="passwordDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="passwordSaving" @click="submitPasswordChange">确认修改</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -208,10 +220,13 @@ const FieldTable = defineComponent({
   setup(props) { return () => h(ElTable, { data: Object.entries(props.columns).map(([name, value]) => ({ name, ...value })) }, () => [h(ElTableColumn, { prop: 'name', label: '数据库字段', minWidth: 180 }), h(ElTableColumn, { prop: 'type', label: '逻辑类型', width: 130 }), h(ElTableColumn, { prop: 'length', label: '最大长度', width: 120 })]) }
 })
 
-const accounts = [{ label: '管理员', username: 'admin', password: 'admin123' }, { label: '配置员', username: 'config', password: 'config123' }, { label: '执行员', username: 'runner', password: 'runner123' }, { label: '查看员', username: 'viewer', password: 'viewer123' }]
-const loginForm = reactive({ username: 'admin', password: 'admin123' })
+const loginForm = reactive({ username: '', password: '' })
 const loginLoading = ref(false)
 const user = ref(null)
+const mustChangePassword = ref(false)
+const passwordDialogVisible = ref(false)
+const passwordSaving = ref(false)
+const passwordForm = reactive({ oldPassword: '', newPassword: '', confirmPassword: '' })
 const page = ref('dashboard')
 const loading = ref(false)
 const clock = ref('')
@@ -249,12 +264,32 @@ const databaseTypes = [{ value: 'mysql', label: 'MySQL' }, { value: 'postgres', 
 const taskDetailVisible = ref(false), detailTask = ref(null), detailSchema = ref([]), testResult = ref(null), testingTask = ref(false)
 const runDetailVisible = ref(false), runDetail = ref(null)
 
-function fillAccount(account) { loginForm.username = account.username; loginForm.password = account.password }
-async function login() { loginLoading.value = true; try { const result = await api('/api/login', { method: 'POST', body: JSON.stringify(loginForm) }); setToken(result.token); user.value = result.user; await selectPage('dashboard') } catch (error) { ElMessage.error(error.message) } finally { loginLoading.value = false } }
-async function logout() { try { await api('/api/logout', { method: 'POST' }) } catch {} setToken(''); user.value = null }
-async function restore() { if (!getToken()) return; try { user.value = (await api('/api/session')).user; await selectPage('dashboard') } catch { setToken('') } }
+function openPasswordDialog() { Object.assign(passwordForm, { oldPassword: '', newPassword: '', confirmPassword: '' }); passwordDialogVisible.value = true }
+async function submitPasswordChange() {
+  if (!passwordForm.oldPassword || !passwordForm.newPassword) { ElMessage.warning('请填写原密码与新密码'); return }
+  if (passwordForm.newPassword !== passwordForm.confirmPassword) { ElMessage.warning('两次输入的新密码不一致'); return }
+  passwordSaving.value = true
+  try {
+    const result = await api('/api/password/change', { method: 'POST', body: JSON.stringify({ oldPassword: passwordForm.oldPassword, newPassword: passwordForm.newPassword }) })
+    if (result.token) setToken(result.token)
+    if (result.user) user.value = result.user
+    mustChangePassword.value = false
+    passwordDialogVisible.value = false
+    Object.assign(passwordForm, { oldPassword: '', newPassword: '', confirmPassword: '' })
+    ElMessage.success('密码已修改')
+    await selectPage('dashboard')
+  } catch (error) { ElMessage.error(error.message) } finally { passwordSaving.value = false }
+}
+function handleApiError(error) {
+  if (error.status === 401) { logout(); return }
+  if (error.code === 'MUST_CHANGE_PASSWORD') { mustChangePassword.value = true; openPasswordDialog(); return }
+  ElMessage.error(error.message)
+}
+async function login() { loginLoading.value = true; try { const result = await api('/api/login', { method: 'POST', body: JSON.stringify(loginForm) }); setToken(result.token); user.value = result.user; mustChangePassword.value = !!result.mustChangePassword; loginForm.password = ''; if (mustChangePassword.value) { ElMessage.warning('首次登录请先修改初始密码'); openPasswordDialog() } else { await selectPage('dashboard') } } catch (error) { ElMessage.error(error.message) } finally { loginLoading.value = false } }
+async function logout() { try { await api('/api/logout', { method: 'POST' }) } catch {} setToken(''); user.value = null; mustChangePassword.value = false; passwordDialogVisible.value = false }
+async function restore() { if (!getToken()) return; try { const session = (await api('/api/session')).user; user.value = session; mustChangePassword.value = !!session.mustChangePassword; if (mustChangePassword.value) openPasswordDialog(); else await selectPage('dashboard') } catch { setToken('') } }
 async function selectPage(target) { const meta = pages.find(item => item.key === target); if (!meta || !can(meta.permission)) target = 'dashboard'; page.value = target; await refreshPage() }
-async function refreshPage() { loading.value = true; try { if (page.value === 'dashboard') await loadDashboard(); else if (page.value === 'tasks') await loadTasks(); else if (page.value === 'datasources') await loadSources(); else if (page.value === 'runs') { await loadTaskOptions(); await loadRuns() } else if (page.value === 'data') { await loadTaskOptions(); if (!dataTaskId.value) dataTaskId.value = tasks.value[0]?.id; await loadData() } else if (page.value === 'alerts') await loadAlerts(); else if (page.value === 'settings') await loadSettings() } catch (error) { if (error.status === 401) logout(); else ElMessage.error(error.message) } finally { loading.value = false } }
+async function refreshPage() { loading.value = true; try { if (page.value === 'dashboard') await loadDashboard(); else if (page.value === 'tasks') await loadTasks(); else if (page.value === 'datasources') await loadSources(); else if (page.value === 'runs') { await loadTaskOptions(); await loadRuns() } else if (page.value === 'data') { await loadTaskOptions(); if (!dataTaskId.value) dataTaskId.value = tasks.value[0]?.id; await loadData() } else if (page.value === 'alerts') await loadAlerts(); else if (page.value === 'settings') await loadSettings() } catch (error) { handleApiError(error) } finally { loading.value = false } }
 async function loadDashboard() { Object.assign(dashboard, await api('/api/dashboard')) }
 async function loadTaskOptions() { const result = await api('/api/tasks'); tasks.value = result.items; runningTaskIds.value = result.runningTaskIds || [] }
 async function loadTasks() { const query = new URLSearchParams(taskFilters); const [taskResult, sourceResult, groupResult] = await Promise.all([api(`/api/tasks?${query}`), api('/api/datasources'), api('/api/groups')]); tasks.value = taskResult.items; runningTaskIds.value = taskResult.runningTaskIds || []; sources.value = sourceResult.items; groups.value = groupResult.items }

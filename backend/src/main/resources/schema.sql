@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS sys_user (
     display_name VARCHAR(120) NOT NULL,
     role_name VARCHAR(40) NOT NULL,
     active TINYINT NOT NULL DEFAULT 1,
+    must_change_password TINYINT NOT NULL DEFAULT 0,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -137,6 +138,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ip_address VARCHAR(80) NOT NULL DEFAULT '',
     prev_hash VARCHAR(64) NOT NULL DEFAULT '',
     row_hash VARCHAR(64) NOT NULL DEFAULT '',
+    chain_version INT NOT NULL DEFAULT 1,
     created_at DATETIME NOT NULL,
     INDEX idx_audit_created(created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
